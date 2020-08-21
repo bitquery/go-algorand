@@ -17,6 +17,7 @@
 package v2
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net/http"
 	"strings"
@@ -24,9 +25,7 @@ import (
 	"github.com/algorand/go-codec/codec"
 	"github.com/labstack/echo/v4"
 
-	"github.com/algorand/go-algorand/daemon/algod/api/server/lib"
 	"github.com/algorand/go-algorand/daemon/algod/api/server/v2/generated"
-	"github.com/algorand/go-algorand/daemon/algod/api/server/v2/generated/private"
 	"github.com/algorand/go-algorand/data"
 	"github.com/algorand/go-algorand/data/basics"
 	"github.com/algorand/go-algorand/data/transactions"
@@ -43,6 +42,10 @@ func returnError(ctx echo.Context, code int, internal error, external string, lo
 
 func badRequest(ctx echo.Context, internal error, external string, log logging.Logger) error {
 	return returnError(ctx, http.StatusBadRequest, internal, external, log)
+}
+
+func serviceUnavailable(ctx echo.Context, internal error, external string, log logging.Logger) error {
+	return returnError(ctx, http.StatusServiceUnavailable, internal, external, log)
 }
 
 func internalError(ctx echo.Context, internal error, external string, log logging.Logger) error {
@@ -82,7 +85,7 @@ func byteOrNil(data []byte) *[]byte {
 	return &data
 }
 
-func computeAssetIndexInPayset(tx node.TxnWithStatus, txnCounter uint64, payset []transactions.SignedTxnWithAD) (aidx *uint64) {
+func computeCreatableIndexInPayset(tx node.TxnWithStatus, txnCounter uint64, payset []transactions.SignedTxnWithAD) (cidx *uint64) {
 	// Compute transaction index in block
 	offset := -1
 	for idx, stxnib := range payset {
@@ -101,6 +104,8 @@ func computeAssetIndexInPayset(tx node.TxnWithStatus, txnCounter uint64, payset 
 	idx := txnCounter - uint64(len(payset)) + uint64(offset) + 1
 	return &idx
 }
+
+
 
 // computeAssetIndexFromTxn returns the created asset index given a confirmed
 // transaction whose confirmation block is available in the ledger. Note that
@@ -134,25 +139,62 @@ func computeAssetIndexFromTxn(tx node.TxnWithStatus, l *data.Ledger) (aidx *uint
 		return nil
 	}
 
-	return computeAssetIndexInPayset(tx, blk.BlockHeader.TxnCounter, payset)
+	return computeCreatableIndexInPayset(tx, blk.BlockHeader.TxnCounter, payset)
 }
 
-func getCodecHandle(formatPtr *string) (codec.Handle, error) {
+// computeAppIndexFromTxn returns the created app index given a confirmed
+// transaction whose confirmation block is available in the ledger. Note that
+// 0 is an invalid asset index (they start at 1).
+func computeAppIndexFromTxn(tx node.TxnWithStatus, l *data.Ledger) (aidx *uint64) {
+	// Must have ledger
+	if l == nil {
+		return nil
+	}
+	// Transaction must be confirmed
+	if tx.ConfirmedRound == 0 {
+		return nil
+	}
+	// Transaction must be ApplicationCall transaction
+	if tx.Txn.Txn.ApplicationCallTxnFields.Empty() {
+		return nil
+	}
+	// Transaction must be creating an application
+	if tx.Txn.Txn.ApplicationCallTxnFields.ApplicationID != 0 {
+		return nil
+	}
+
+	// Look up block where transaction was confirmed
+	blk, err := l.Block(tx.ConfirmedRound)
+	if err != nil {
+		return nil
+	}
+
+	payset, err := blk.DecodePaysetFlat()
+	if err != nil {
+		return nil
+	}
+
+	return computeCreatableIndexInPayset(tx, blk.BlockHeader.TxnCounter, payset)
+}
+
+
+// getCodecHandle converts a format string into the encoder + content type
+func getCodecHandle(formatPtr *string) (codec.Handle, string, error) {
 	format := "json"
 	if formatPtr != nil {
 		format = strings.ToLower(*formatPtr)
 	}
 
-	var handle codec.Handle = protocol.JSONHandle
-	if format == "json" {
-		handle = protocol.JSONHandle
-	} else if format == "msgpack" || format == "msgp" {
-		handle = protocol.CodecHandle
-	} else {
-		return nil, fmt.Errorf("invalid format: %s", format)
+	switch format {
+	case "json":
+		return protocol.JSONHandle, "application/json", nil
+	case "msgpack":
+		fallthrough
+	case "msgp":
+		return protocol.CodecHandle, "application/msgpack", nil
+	default:
+		return nil, "", fmt.Errorf("invalid format: %s", format)
 	}
-
-	return handle, nil
 }
 
 func encode(handle codec.Handle, obj interface{}) ([]byte, error) {
@@ -166,82 +208,61 @@ func encode(handle codec.Handle, obj interface{}) ([]byte, error) {
 	return output, nil
 }
 
-func decode(handle codec.Handle, input []byte, output interface{}) error {
-	//enc := codec.NewEncoderBytes(&output, handle)
-	dec := codec.NewDecoderBytes(input, handle)
+func decode(handle codec.Handle, data []byte, v interface{}) error {
+	enc := codec.NewDecoderBytes(data, handle)
 
-	err := dec.Decode(output)
+	err := enc.Decode(v)
 	if err != nil {
 		return fmt.Errorf("failed to decode object: %v", err)
 	}
 	return nil
 }
 
-// Uses the 'codec:' annotations to reserialize an object.
-func toCodecMap(input interface{}, output *map[string]interface{}) (err error) {
-	var encoded []byte
-	encoded, err = encode(protocol.CodecHandle, input)
-	if err != nil {
-		return
+// Helper to convert basics.StateDelta -> *generated.StateDelta
+func stateDeltaToStateDelta(d basics.StateDelta) *generated.StateDelta {
+	if len(d) == 0 {
+		return nil
+	}
+	var delta generated.StateDelta
+	for k, v:= range d {
+		delta = append(delta, generated.EvalDeltaKeyValue{
+			Key:   base64.StdEncoding.EncodeToString([]byte(k)),
+			Value: generated.EvalDelta{
+				Action: uint64(v.Action),
+				Bytes:  strOrNil(base64.StdEncoding.EncodeToString([]byte(v.Bytes))),
+				Uint:   numOrNil(v.Uint),
+			},
+		})
+	}
+	return &delta
+}
+
+func convertToDeltas(txn node.TxnWithStatus) (*[]generated.AccountStateDelta, *generated.StateDelta) {
+	var localStateDelta *[]generated.AccountStateDelta
+	if len(txn.ApplyData.EvalDelta.LocalDeltas) > 0 {
+		d := make([]generated.AccountStateDelta, 0)
+		accounts := txn.Txn.Txn.Accounts
+
+		for k, v := range txn.ApplyData.EvalDelta.LocalDeltas {
+			// Resolve address from index
+			var addr string
+			if k == 0 {
+				addr = txn.Txn.Txn.Sender.String()
+			} else {
+				if int(k - 1) < len(accounts) {
+					addr = txn.Txn.Txn.Accounts[k-1].String()
+				} else {
+					addr = fmt.Sprintf("Invalid Address Index: %d", k - 1)
+				}
+			}
+			d = append(d, generated.AccountStateDelta{
+				Address: addr,
+				Delta:   *(stateDeltaToStateDelta(v)),
+			})
+		}
+
+		localStateDelta = &d
 	}
 
-	err = decode(protocol.CodecHandle, encoded, &output)
-	return
-}
-
-type pathCollectingRouter struct {
-	paths map[echo.Route]echo.HandlerFunc
-}
-
-func (p *pathCollectingRouter) CONNECT(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route {
-	p.paths[echo.Route{Method: echo.CONNECT, Path: path}] = h
-	return nil
-}
-func (p *pathCollectingRouter) DELETE(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route {
-	p.paths[echo.Route{Method: echo.DELETE, Path: path}] = h
-	return nil
-}
-func (p *pathCollectingRouter) GET(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route {
-	p.paths[echo.Route{Method: echo.GET, Path: path}] = h
-	return nil
-}
-func (p *pathCollectingRouter) HEAD(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route {
-	p.paths[echo.Route{Method: echo.HEAD, Path: path}] = h
-	return nil
-}
-func (p *pathCollectingRouter) OPTIONS(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route {
-	p.paths[echo.Route{Method: echo.OPTIONS, Path: path}] = h
-	return nil
-}
-func (p *pathCollectingRouter) PATCH(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route {
-	p.paths[echo.Route{Method: echo.PATCH, Path: path}] = h
-	return nil
-}
-func (p *pathCollectingRouter) POST(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route {
-	p.paths[echo.Route{Method: echo.POST, Path: path}] = h
-	return nil
-}
-func (p *pathCollectingRouter) PUT(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route {
-	p.paths[echo.Route{Method: echo.PUT, Path: path}] = h
-	return nil
-}
-func (p *pathCollectingRouter) TRACE(path string, h echo.HandlerFunc, m ...echo.MiddlewareFunc) *echo.Route {
-	p.paths[echo.Route{Method: echo.TRACE, Path: path}] = h
-	return nil
-}
-
-// GetRoutes returns a map of all the routes defined in the V2 router
-func GetRoutes(ctx lib.ReqContext, privateEndpoints bool) map[echo.Route]echo.HandlerFunc {
-	handlers := &Handlers{
-		Node:     ctx.Node,
-		Log:      ctx.Log,
-		Shutdown: ctx.Shutdown,
-	}
-	collector := pathCollectingRouter{paths: make(map[echo.Route]echo.HandlerFunc)}
-	if privateEndpoints {
-		private.RegisterHandlers(&collector, handlers)
-	} else {
-		generated.RegisterHandlers(&collector, handlers)
-	}
-	return collector.paths
+	return localStateDelta, stateDeltaToStateDelta(txn.ApplyData.EvalDelta.GlobalDelta)
 }

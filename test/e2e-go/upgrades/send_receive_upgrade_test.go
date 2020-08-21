@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License
 // along with go-algorand.  If not, see <https://www.gnu.org/licenses/>.
 
-package transactions
+package upgrades
 
 import (
 	"math/rand"
@@ -80,17 +80,15 @@ func TestAccountsCanSendMoneyAcrossUpgradeV15toV16(t *testing.T) {
 }
 
 func TestAccountsCanSendMoneyAcrossUpgradeV21toV22(t *testing.T) {
-	if runtime.GOOS == "darwin" {
-		t.Skip()
-	}
 	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV21Upgrade.json"))
 }
 
 func TestAccountsCanSendMoneyAcrossUpgradeV22toV23(t *testing.T) {
-	if runtime.GOOS == "darwin" {
-		t.Skip()
-	}
 	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV22Upgrade.json"))
+}
+
+func TestAccountsCanSendMoneyAcrossUpgradeV23toV24(t *testing.T) {
+	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV23Upgrade.json"))
 }
 
 // ConsensusTestFastUpgrade is meant for testing of protocol upgrades:
@@ -187,7 +185,7 @@ func testAccountsCanSendMoneyAcrossUpgrade(t *testing.T, templatePath string) {
 
 		time.Sleep(time.Second)
 
-		if time.Now().After(startTime.Add(2 * time.Minute)) {
+		if time.Now().After(startTime.Add(3 * time.Minute)) {
 			a.Fail("upgrade taking too long")
 		}
 	}

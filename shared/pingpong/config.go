@@ -52,6 +52,9 @@ type PpConfig struct {
 	GroupSize       uint32
 	NumAsset        uint32
 	MinAccountAsset uint64
+	NumApp          uint32
+	AppProgOps      uint32
+	Rekey           bool
 }
 
 // DefaultConfig object for Ping Pong
@@ -73,6 +76,9 @@ var DefaultConfig = PpConfig{
 	GroupSize:       1,
 	NumAsset:        0,
 	MinAccountAsset: 10000000,
+	NumApp:          0,
+	AppProgOps:      0,
+	Rekey:           false,
 }
 
 // LoadConfigFromFile reads and loads Ping Pong configuration
