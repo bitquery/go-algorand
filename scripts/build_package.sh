@@ -111,10 +111,19 @@ TOOLS_ROOT=${PKG_ROOT}/tools
 
 echo "Staging tools package files"
 
-bin_files=("algons" "auctionconsole" "auctionmaster" "auctionminion" "coroner" "dispenser" "netgoal" "nodecfg" "pingpong" "cc_service" "cc_agent" "cc_client" "COPYING")
+bin_files=("algons" "auctionconsole" "auctionmaster" "auctionminion" "coroner" "dispenser" "netgoal" "nodecfg" "pingpong" "cc_service" "cc_agent" "cc_client" "COPYING" "dsign")
 mkdir -p ${TOOLS_ROOT}
 for bin in "${bin_files[@]}"; do
     cp ${GOPATHBIN}/${bin} ${TOOLS_ROOT}
+    if [ $? -ne 0 ]; then exit 1; fi
+done
+
+echo "Staging test util package files"
+TEST_UTILS_ROOT=${PKG_ROOT}/test-utils
+bin_files=("auctionbank" "algotmpl" "COPYING")
+mkdir -p ${TEST_UTILS_ROOT}
+for bin in "${bin_files[@]}"; do
+    cp ${GOPATHBIN}/${bin} ${TEST_UTILS_ROOT}
     if [ $? -ne 0 ]; then exit 1; fi
 done
 

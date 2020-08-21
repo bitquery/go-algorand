@@ -185,6 +185,10 @@ type GossipNode interface {
 	// arrive very quickly, but might be missing some votes. The usage of this call is expected to have similar
 	// characteristics as with a watchdog timer.
 	OnNetworkAdvance()
+
+	// GetHTTPRequestConnection returns the underlying connection for the given request. Note that the request must be the same
+	// request that was provided to the http handler ( or provide a fallback Context() to that )
+	GetHTTPRequestConnection(request *http.Request) (conn net.Conn)
 }
 
 // IncomingMessage represents a message arriving from some peer in our p2p network
@@ -762,6 +766,7 @@ func (wn *WebsocketNetwork) innerStop() {
 // Stop closes network connections and stops threads.
 // Stop blocks until all activity on this node is done.
 func (wn *WebsocketNetwork) Stop() {
+	wn.handlers.ClearHandlers([]Tag{})
 	wn.innerStop()
 	var listenAddr string
 	if wn.listener != nil {
@@ -787,7 +792,8 @@ func (wn *WebsocketNetwork) RegisterHandlers(dispatch []TaggedMessageHandler) {
 
 // ClearHandlers deregisters all the existing message handlers.
 func (wn *WebsocketNetwork) ClearHandlers() {
-	wn.handlers.ClearHandlers()
+	// exclude the internal handlers. These would get cleared out when Stop is called.
+	wn.handlers.ClearHandlers([]Tag{protocol.PingTag, protocol.PingReplyTag, protocol.NetPrioResponseTag})
 }
 
 func (wn *WebsocketNetwork) setHeaders(header http.Header) {
@@ -943,6 +949,17 @@ func (wn *WebsocketNetwork) checkIncomingConnectionVariables(response http.Respo
 		return http.StatusLoopDetected
 	}
 	return http.StatusOK
+}
+
+// GetHTTPRequestConnection returns the underlying connection for the given request. Note that the request must be the same
+// request that was provided to the http handler ( or provide a fallback Context() to that )
+// if the provided request has no associated connection, it returns nil. ( this should not happen for any http request that was registered
+// by WebsocketNetwork )
+func (wn *WebsocketNetwork) GetHTTPRequestConnection(request *http.Request) (conn net.Conn) {
+	if wn.requestsTracker != nil {
+		conn = wn.requestsTracker.GetRequestConnection(request)
+	}
+	return
 }
 
 // ServerHTTP handles the gossip network functions over websockets

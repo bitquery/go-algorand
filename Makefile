@@ -1,18 +1,19 @@
-GOPATH		:= $(shell go env GOPATH)
+export GOPATH		:= $(shell go env GOPATH)
 GOPATH1		:= $(firstword $(subst :, ,$(GOPATH)))
-export GOPATH
-GO111MODULE	:= on
-export GO111MODULE
+export GO111MODULE	:= on
+export GOPROXY := direct
+
 UNAME		:= $(shell uname)
 SRCPATH     := $(shell pwd)
 ARCH        := $(shell ./scripts/archtype.sh)
 OS_TYPE     := $(shell ./scripts/ostype.sh)
+S3_RELEASE_BUCKET = $$S3_RELEASE_BUCKET
 
 # If build number already set, use it - to ensure same build number across multiple platforms being built
 BUILDNUMBER      ?= $(shell ./scripts/compute_build_number.sh)
 COMMITHASH       := $(shell ./scripts/compute_build_commit.sh)
-BUILDBRANCH      ?= $(shell ./scripts/compute_branch.sh)
-BUILDCHANNEL     ?= $(shell ./scripts/compute_branch_channel.sh $(BUILDBRANCH))
+BUILDBRANCH      := $(shell ./scripts/compute_branch.sh)
+CHANNEL          ?= $(shell ./scripts/compute_branch_channel.sh $(BUILDBRANCH))
 DEFAULTNETWORK   ?= $(shell ./scripts/compute_branch_network.sh $(BUILDBRANCH))
 DEFAULT_DEADLOCK ?= $(shell ./scripts/compute_branch_deadlock_default.sh $(BUILDBRANCH))
 
@@ -47,12 +48,12 @@ GOLDFLAGS_BASE  := -X github.com/algorand/go-algorand/config.BuildNumber=$(BUILD
 		 -extldflags \"$(EXTLDFLAGS)\"
 
 GOLDFLAGS := $(GOLDFLAGS_BASE) \
-		 -X github.com/algorand/go-algorand/config.Channel=$(BUILDCHANNEL)
+		 -X github.com/algorand/go-algorand/config.Channel=$(CHANNEL)
 
 UNIT_TEST_SOURCES := $(sort $(shell GO111MODULE=off go list ./... | grep -v /go-algorand/test/ ))
 ALGOD_API_PACKAGES := $(sort $(shell GO111MODULE=off cd daemon/algod/api; go list ./... ))
 
-MSGP_GENERATE	:= ./protocol ./crypto ./data/basics ./data/transactions ./data/committee ./data/bookkeeping ./data/hashable ./auction ./agreement ./rpcs ./node
+MSGP_GENERATE	:= ./protocol ./crypto ./data/basics ./data/transactions ./data/committee ./data/bookkeeping ./data/hashable ./auction ./agreement ./rpcs ./node ./ledger
 
 default: build
 
@@ -60,6 +61,7 @@ default: build
 
 fmt:
 	go fmt ./...
+	./scripts/check_license.sh -i
 
 fix: build
 	$(GOPATH1)/bin/algofix */
@@ -73,13 +75,10 @@ lint: deps
 vet:
 	go vet ./...
 
-check_license:
-	./scripts/check_license.sh
-
 check_shell:
 	find . -type f -name "*.sh" -exec shellcheck {} +
 
-sanity: vet fix lint fmt check_license
+sanity: vet fix lint fmt
 
 cover:
 	go test $(GOTAGS) -coverprofile=cover.out $(UNIT_TEST_SOURCES)
@@ -134,7 +133,7 @@ KMD_API_SWAGGER_INJECT := daemon/kmd/lib/kmdapi/bundledSpecInject.go
 
 $(KMD_API_SWAGGER_SPEC): $(KMD_API_FILES) crypto/libs/$(OS_TYPE)/$(ARCH)/lib/libsodium.a
 	cd daemon/kmd/lib/kmdapi && \
-		python genSwaggerWrappers.py $(KMD_API_SWAGGER_WRAPPER)
+		python3 genSwaggerWrappers.py $(KMD_API_SWAGGER_WRAPPER)
 	cd daemon/kmd && \
 		PATH=$(GOPATH1)/bin:$$PATH \
 		go generate ./...
@@ -157,8 +156,14 @@ $(KMD_API_SWAGGER_INJECT): $(KMD_API_SWAGGER_SPEC) $(KMD_API_SWAGGER_SPEC).valid
 
 build: buildsrc gen
 
+# We're making an empty file in the go-cache dir to
+# get around a bug in go build where it will fail
+# to cache binaries from time to time on empty NFS
+# dirs
 buildsrc: crypto/libs/$(OS_TYPE)/$(ARCH)/lib/libsodium.a node_exporter NONGO_BIN deps $(ALGOD_API_SWAGGER_INJECT) $(KMD_API_SWAGGER_INJECT)
-	go install $(GOTRIMPATH) $(GOTAGS) $(GOBUILDMODE) -ldflags="$(GOLDFLAGS)" ./...
+	mkdir -p tmp/go-cache && \
+	touch tmp/go-cache/file.txt && \
+	GOCACHE=$(SRCPATH)/tmp/go-cache go install $(GOTRIMPATH) $(GOTAGS) $(GOBUILDMODE) -ldflags="$(GOLDFLAGS)" ./...
 
 SOURCES_RACE := github.com/algorand/go-algorand/cmd/kmd
 
@@ -192,13 +197,13 @@ test: build
 
 fulltest: build-race
 	for PACKAGE_DIRECTORY in $(UNIT_TEST_SOURCES) ; do \
-		go test $(GOTAGS) -timeout 2000s -race $$PACKAGE_DIRECTORY; \
+		go test $(GOTAGS) -timeout 2500s -race $$PACKAGE_DIRECTORY; \
 	done
 
 shorttest: build-race $(addprefix short_test_target_, $(UNIT_TEST_SOURCES))
 
 $(addprefix short_test_target_, $(UNIT_TEST_SOURCES)): build
-	@go test $(GOTAGS) -short -timeout 2000s -race $(subst short_test_target_,,$@)
+	@go test $(GOTAGS) -short -timeout 2500s -race $(subst short_test_target_,,$@)
 
 integration: build-race
 	./test/scripts/run_integration_tests.sh
@@ -235,7 +240,10 @@ node_exporter: $(GOPATH1)/bin/node_exporter
 # The file is was taken from the S3 cloud and it traditionally stored at
 # /travis-build-artifacts-us-ea-1.algorand.network/algorand/node_exporter/latest/node_exporter-stable-linux-x86_64.tar.gz
 $(GOPATH1)/bin/node_exporter:
-	tar -xzvf installer/external/node_exporter-stable-$(shell ./scripts/ostype.sh)-$(shell uname -m | tr '[:upper:]' '[:lower:]').tar.gz -C $(GOPATH1)/bin
+	mkdir -p $(GOPATH1)/bin && \
+	cd $(GOPATH1)/bin && \
+	tar -xzvf $(SRCPATH)/installer/external/node_exporter-stable-$(shell ./scripts/ostype.sh)-$(shell uname -m | tr '[:upper:]' '[:lower:]').tar.gz && \
+	cd -
 
 # deploy
 
@@ -276,14 +284,15 @@ dump: $(addprefix gen/,$(addsuffix /genesis.dump, $(NETWORKS)))
 install: build
 	scripts/dev_install.sh -p $(GOPATH1)/bin
 
-.PHONY: default fmt vet lint check_license check_shell sanity cover prof deps build test fulltest shorttest clean cleango deploy node_exporter install %gen gen NONGO_BIN
+.PHONY: default fmt vet lint check_shell sanity cover prof deps build test fulltest shorttest clean cleango deploy node_exporter install %gen gen NONGO_BIN
 
-### TARGETS FOR CICD PROCESS
+###### TARGETS FOR CICD PROCESS ######
+include ./scripts/release/mule/Makefile.mule
 
-ci-deps:
-	scripts/configure_dev-deps.sh && \
-	scripts/check_deps.sh
+SUPPORTED_ARCHIVE_OS_ARCH = linux/amd64 linux/arm64 linux/arm darwin/amd64
 
-ci-build: buildsrc gen
-	mkdir -p $(SRCPATH)/tmp/node_pkgs/$(OS_TYPE)/$(ARCH) && \
-	PKG_ROOT=$(SRCPATH)/tmp/node_pkgs/$(OS_TYPE)/$(ARCH) NO_BUILD=True VARIATIONS=$(OS_TYPE)/$(ARCH) scripts/build_packages.sh $(OS_TYPE)/$(ARCH)
+archive:
+	CHANNEL=$(CHANNEL) \
+	PATH=$(SRCPATH)/tmp/node_pkgs/$(OS_TYPE)/$(ARCH)/bin:$${PATH} \
+	scripts/upload_version.sh $(CHANNEL) $(SRCPATH)/tmp/node_pkgs $(S3_RELEASE_BUCKET)
+
