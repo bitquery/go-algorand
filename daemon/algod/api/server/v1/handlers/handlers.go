@@ -37,6 +37,7 @@ import (
 	"github.com/algorand/go-algorand/data/basics"
 	"github.com/algorand/go-algorand/data/bookkeeping"
 	"github.com/algorand/go-algorand/data/transactions"
+	"github.com/algorand/go-algorand/data/transactions/logic"
 	"github.com/algorand/go-algorand/ledger"
 	"github.com/algorand/go-algorand/node"
 	"github.com/algorand/go-algorand/protocol"
@@ -76,7 +77,8 @@ func decorateUnknownTransactionTypeError(err error, txs node.TxnWithStatus) erro
 // txEncode copies the data fields of the internal transaction object and populate the v1.Transaction accordingly.
 // if unexpected transaction type is encountered, an error is returned. The caller is expected to ignore the returned
 // transaction when error is non-nil.
-func txEncode(tx transactions.Transaction, ad transactions.ApplyData) (v1.Transaction, error) {
+func txEncode(signedTx transactions.SignedTxn, ad transactions.ApplyData) (v1.Transaction, error) {
+	var tx transactions.Transaction = signedTx.Txn
 	var res v1.Transaction
 	switch tx.Type {
 	case protocol.PaymentTx:
@@ -112,6 +114,40 @@ func txEncode(tx transactions.Transaction, ad transactions.ApplyData) (v1.Transa
 
 	if tx.Lease != ([32]byte{}) {
 		res.Lease = tx.Lease[:]
+	}
+
+	if signedTx.Lsig.Logic != nil {
+		res.LogicSig = new(v1.LogicSignature)
+		res.LogicSig.Args = signedTx.Lsig.Args
+		res.LogicSig.Logic = signedTx.Lsig.Logic
+		res.LogicSig.Source, _ = logic.Disassemble(signedTx.Lsig.Logic)
+
+		for _, v := range signedTx.Sig {
+			if v != 0 {
+				res.LogicSig.Signature = new(v1.Signature)
+				res.LogicSig.Signature.Signature = signedTx.Sig
+				break
+			}
+		}
+
+		if len(signedTx.Msig.Subsigs) != 0 {
+
+			res.LogicSig.MultisigSignature = new(v1.MultisigSignature)
+			res.LogicSig.MultisigSignature.Version = signedTx.Msig.Version
+			res.LogicSig.MultisigSignature.Threshold = signedTx.Msig.Threshold
+
+			var subs []v1.MultisigSubSignature
+
+			for _, sub := range signedTx.Msig.Subsigs {
+				var api_sub v1.MultisigSubSignature
+				api_sub.Signature = sub.Sig
+				api_sub.PublicKey = sub.Key
+				subs = append(subs, api_sub)
+			}
+
+			res.LogicSig.MultisigSignature.MultisigSubSignature = subs
+		}
+
 	}
 
 	return res, nil
@@ -330,7 +366,7 @@ func assetFreezeTxEncode(tx transactions.Transaction, ad transactions.ApplyData)
 }
 
 func txWithStatusEncode(tr node.TxnWithStatus) (v1.Transaction, error) {
-	s, err := txEncode(tr.Txn.Txn, tr.ApplyData)
+	s, err := txEncode(tr.Txn, tr.ApplyData)
 	if err != nil {
 		err = decorateUnknownTransactionTypeError(err, tr)
 		return v1.Transaction{}, err
@@ -1082,7 +1118,7 @@ func GetPendingTransactions(ctx lib.ReqContext, context echo.Context) {
 
 	responseTxs := make([]v1.Transaction, len(txs))
 	for i, twr := range txs {
-		responseTxs[i], err = txEncode(twr.Txn, transactions.ApplyData{})
+		responseTxs[i], err = txEncode(twr, transactions.ApplyData{})
 		if err != nil {
 			// update the error as needed
 			err = decorateUnknownTransactionTypeError(err, node.TxnWithStatus{Txn: twr})
@@ -1189,7 +1225,7 @@ func GetPendingTransactionsByAddress(ctx lib.ReqContext, context echo.Context) {
 				break
 			}
 
-			tx, err := txEncode(twr.Txn, transactions.ApplyData{})
+			tx, err := txEncode(twr, transactions.ApplyData{})
 			responseTxs = append(responseTxs, tx)
 			if err != nil {
 				// update the error as needed
