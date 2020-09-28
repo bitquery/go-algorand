@@ -422,6 +422,89 @@ type AssetHolding struct {
 	Frozen bool `json:"frozen"`
 }
 
+// MultisigSubSignature is the part of MultisigSubSignature structure
+// type
+// swagger:model MultisigSubSignature
+type MultisigSubSignature struct {
+	// Public Key
+	//
+	// required: false
+	// swagger:strfmt byte
+	PublicKey [32]byte `json:"public_key,omitempty"`
+
+	// Signature
+	//
+	// required: false
+	// swagger:strfmt byte
+	Signature [64]byte `json:"signature,omitempty"`
+}
+
+// MultisigSignature is the structure that holds multiple Subsigs
+// type
+// swagger:model MultisigSignature
+type MultisigSignature struct {
+
+	// Version
+	//
+	// required: true
+	Version uint8 `json:"version"`
+
+	// Threshold
+	//
+	// required: true
+	Threshold uint8 `json:"threshold"`
+
+	// MultisigSubSignature
+	//
+	// required: true
+	MultisigSubSignature []MultisigSubSignature `json:"subsig"`
+}
+
+// Signature is the  Signature structure
+// type
+// swagger:model Signature
+type Signature struct {
+
+	// Signature
+	//
+	// required: false
+	// swagger:strfmt byte
+	Signature [64]byte `json:"signature,omitempty"`
+}
+
+// Transaction TEAL signature and arguments
+// type
+// swagger:model LogicSignature
+type LogicSignature struct {
+
+	// Logic code applied to transaction
+	//
+	// required: true
+	// swagger:strfmt byte
+	Logic []byte `json:"code"`
+
+	// Args are not signed, but checked by Logic
+	//
+	// required: false
+	// swagger:strfmt byte
+	Args [][]byte `json:"args"`
+
+	// Disasembled source code
+	//
+	// required: true
+	Source string `json:"source"`
+
+	// Optional signature applied to transaction
+	//
+	// required: false
+	Signature *Signature `json:"signature,omitempty"`
+
+	// Optional signature applied to transaction
+	//
+	// required: false
+	MultisigSignature *MultisigSignature `json:"multi_signature,omitempty"`
+}
+
 // Transaction contains all fields common to all transactions and serves as an envelope to all transactions
 // type
 // swagger:model Transaction
@@ -546,6 +629,11 @@ type Transaction struct {
 	// required: false
 	// swagger:strfmt byte
 	Group []byte `json:"group,omitempty"`
+
+	// Logic Signature if any
+	//
+	// required: false
+	LogicSig *LogicSignature `json:"logic_signature,omitempty"`
 }
 
 // PaymentTransactionType contains the additional fields for a payment Transaction
