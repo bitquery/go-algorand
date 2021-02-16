@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -32,7 +32,7 @@ import (
 // PendingTxAggregate is a container of pending transactions
 type PendingTxAggregate interface {
 	PendingTxIDs() []transactions.Txid
-	Pending() [][]transactions.SignedTxn
+	PendingTxGroups() [][]transactions.SignedTxn
 }
 
 // TxSyncClient abstracts sync-ing pending transactions from a peer.

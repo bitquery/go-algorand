@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -74,7 +74,7 @@ func BenchmarkTxHandlerProcessDecoded(b *testing.B) {
 
 	cfg.TxPoolSize = 20000
 	cfg.EnableProcessBlockStats = false
-	tp := pools.MakeTransactionPool(l.Ledger, cfg)
+	tp := pools.MakeTransactionPool(l.Ledger, cfg, logging.Base())
 	signedTransactions := make([]transactions.SignedTxn, 0, b.N)
 	for i := 0; i < b.N/numUsers; i++ {
 		for u := 0; u < numUsers; u++ {

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -48,21 +48,21 @@ const (
 	// protocol-specific constains would be tested once the decoding is complete.
 	encodedMaxAssetsPerAccount = 1024
 
-	// encodedMaxAppLocalStates is the decoder limit for number of opted-in apps in a single account.
+	// EncodedMaxAppLocalStates is the decoder limit for number of opted-in apps in a single account.
 	// It is verified in TestEncodedAccountAllocationBounds to align with
 	// config.Consensus[protocol.ConsensusCurrentVersion].MaxppsOptedIn
-	encodedMaxAppLocalStates = 64
+	EncodedMaxAppLocalStates = 64
 
-	// encodedMaxAppParams is the decoder limit for number of created apps in a single account.
+	// EncodedMaxAppParams is the decoder limit for number of created apps in a single account.
 	// It is verified in TestEncodedAccountAllocationBounds to align with
 	// config.Consensus[protocol.ConsensusCurrentVersion].MaxAppsCreated
-	encodedMaxAppParams = 64
+	EncodedMaxAppParams = 64
 
-	// encodedMaxKeyValueEntries is the decoder limit for the length of a key/value store.
+	// EncodedMaxKeyValueEntries is the decoder limit for the length of a key/value store.
 	// It is verified in TestEncodedAccountAllocationBounds to align with
 	// config.Consensus[protocol.ConsensusCurrentVersion].MaxLocalSchemaEntries and
 	// config.Consensus[protocol.ConsensusCurrentVersion].MaxGlobalSchemaEntries
-	encodedMaxKeyValueEntries = 1024
+	EncodedMaxKeyValueEntries = 1024
 )
 
 func (s Status) String() string {
@@ -94,7 +94,8 @@ func UnmarshalStatus(value string) (s Status, err error) {
 
 // AccountData contains the data associated with a given address.
 //
-// This includes the account balance, delegation keys, delegation status, and a custom note.
+// This includes the account balance, cryptographic public keys,
+// consensus delegation status, asset data, and application data.
 type AccountData struct {
 	_struct struct{} `codec:",omitempty,omitemptyarray"`
 
@@ -188,11 +189,11 @@ type AccountData struct {
 
 	// AppLocalStates stores the local states associated with any applications
 	// that this account has opted in to.
-	AppLocalStates map[AppIndex]AppLocalState `codec:"appl,allocbound=encodedMaxAppLocalStates"`
+	AppLocalStates map[AppIndex]AppLocalState `codec:"appl,allocbound=EncodedMaxAppLocalStates"`
 
 	// AppParams stores the global parameters and state associated with any
 	// applications that this account has created.
-	AppParams map[AppIndex]AppParams `codec:"appp,allocbound=encodedMaxAppParams"`
+	AppParams map[AppIndex]AppParams `codec:"appp,allocbound=EncodedMaxAppParams"`
 
 	// TotalAppSchema stores the sum of all of the LocalStateSchemas
 	// and GlobalStateSchemas in this account (global for applications
@@ -381,6 +382,14 @@ func (u AccountData) Money(proto config.ConsensusParams, rewardsLevel uint64) (m
 	return e.MicroAlgos, e.RewardedMicroAlgos
 }
 
+// PendingRewards computes the amount of rewards (in microalgos) that
+// have yet to be added to the account balance.
+func PendingRewards(ot *OverflowTracker, proto config.ConsensusParams, microAlgos MicroAlgos, rewardsBase uint64, rewardsLevel uint64) MicroAlgos {
+	rewardsUnits := microAlgos.RewardUnits(proto)
+	rewardsDelta := ot.Sub(rewardsLevel, rewardsBase)
+	return MicroAlgos{Raw: ot.Mul(rewardsUnits, rewardsDelta)}
+}
+
 // WithUpdatedRewards returns an updated number of algos in an AccountData
 // to reflect rewards up to some rewards level.
 func (u AccountData) WithUpdatedRewards(proto config.ConsensusParams, rewardsLevel uint64) AccountData {
@@ -460,6 +469,49 @@ func (u AccountData) IsZero() bool {
 	}
 
 	return reflect.DeepEqual(u, AccountData{})
+}
+
+// NormalizedOnlineBalance returns a ``normalized'' balance for this account.
+//
+// The normalization compensates for rewards that have not yet been applied,
+// by computing a balance normalized to round 0.  To normalize, we estimate
+// the microalgo balance that an account should have had at round 0, in order
+// to end up at its current balance when rewards are included.
+//
+// The benefit of the normalization procedure is that an account's normalized
+// balance does not change over time (unlike the actual algo balance that includes
+// rewards).  This makes it possible to compare normalized balances between two
+// accounts, to sort them, and get results that are close to what we would get
+// if we computed the exact algo balance of the accounts at a given round number.
+//
+// The normalization can lead to some inconsistencies in comparisons between
+// account balances, because the growth rate of rewards for accounts depends
+// on how recently the account has been touched (our rewards do not implement
+// compounding).  However, online accounts have to periodically renew
+// participation keys, so the scale of the inconsistency is small.
+func (u AccountData) NormalizedOnlineBalance(proto config.ConsensusParams) uint64 {
+	if u.Status != Online {
+		return 0
+	}
+
+	// If this account had one RewardUnit of microAlgos in round 0, it would
+	// have perRewardUnit microAlgos at the account's current rewards level.
+	perRewardUnit := u.RewardsBase + proto.RewardUnit
+
+	// To normalize, we compute, mathematically,
+	// u.MicroAlgos / perRewardUnit * proto.RewardUnit, as
+	// (u.MicroAlgos * proto.RewardUnit) / perRewardUnit.
+	norm, overflowed := Muldiv(u.MicroAlgos.ToUint64(), proto.RewardUnit, perRewardUnit)
+
+	// Mathematically should be impossible to overflow
+	// because perRewardUnit >= proto.RewardUnit, as long
+	// as u.RewardBase isn't huge enough to cause overflow..
+	if overflowed {
+		logging.Base().Panicf("overflow computing normalized balance %d * %d / (%d + %d)",
+			u.MicroAlgos.ToUint64(), proto.RewardUnit, u.RewardsBase, proto.RewardUnit)
+	}
+
+	return norm
 }
 
 // BalanceRecord pairs an account's address with its associated data.

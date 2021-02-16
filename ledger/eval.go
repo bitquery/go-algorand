@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -20,9 +20,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
+
+	"github.com/algorand/go-deadlock"
 
 	"github.com/algorand/go-algorand/config"
 	"github.com/algorand/go-algorand/crypto"
+	"github.com/algorand/go-algorand/crypto/compactcert"
 	"github.com/algorand/go-algorand/data/basics"
 	"github.com/algorand/go-algorand/data/bookkeeping"
 	"github.com/algorand/go-algorand/data/committee"
@@ -30,6 +34,7 @@ import (
 	"github.com/algorand/go-algorand/data/transactions/logic"
 	"github.com/algorand/go-algorand/data/transactions/verify"
 	"github.com/algorand/go-algorand/ledger/apply"
+	"github.com/algorand/go-algorand/ledger/ledgercore"
 	"github.com/algorand/go-algorand/logging"
 	"github.com/algorand/go-algorand/protocol"
 	"github.com/algorand/go-algorand/util/execpool"
@@ -43,15 +48,8 @@ var ErrNoSpace = errors.New("block does not have space for transaction")
 // many transactions in a block.
 const maxPaysetHint = 20000
 
-// VerifiedTxnCache captures the interface for a cache of previously
-// verified transactions.  This is expected to match the transaction
-// pool object.
-type VerifiedTxnCache interface {
-	Verified(txn transactions.SignedTxn, params verify.Params) bool
-}
-
 type roundCowBase struct {
-	l ledgerForEvaluator
+	l ledgerForCowBase
 
 	// The round number of the previous block, for looking up prior state.
 	rnd basics.Round
@@ -59,52 +57,202 @@ type roundCowBase struct {
 	// TxnCounter from previous block header.
 	txnCount uint64
 
+	// Round of the next expected compact cert.  In the common case this
+	// is CompactCertNextRound from previous block header, except when
+	// compact certs are first enabled, in which case this gets set
+	// appropriately at the first block where compact certs are enabled.
+	compactCertNextRnd basics.Round
+
 	// The current protocol consensus params.
 	proto config.ConsensusParams
+
+	// The accounts that we're already accessed during this round evaluation. This is a caching
+	// buffer used to avoid looking up the same account data more than once during a single evaluator
+	// execution. The AccountData is always an historical one, then therefore won't be changing.
+	// The underlying (accountupdates) infrastucture may provide additional cross-round caching which
+	// are beyond the scope of this cache.
+	// The account data store here is always the account data without the rewards.
+	accounts map[basics.Address]basics.AccountData
+
+	// accountsMu is the accounts read-write mutex, used to syncronize the access ot the accounts map.
+	accountsMu deadlock.RWMutex
 }
 
 func (x *roundCowBase) getCreator(cidx basics.CreatableIndex, ctype basics.CreatableType) (basics.Address, bool, error) {
 	return x.l.GetCreatorForRound(x.rnd, cidx, ctype)
 }
 
+// lookup returns the non-rewarded account data for the provided account address. It uses the internal per-round cache
+// first, and if it cannot find it there, it would defer to the underlaying implementation.
+// note that errors in accounts data retrivals are not cached as these typically cause the transaction evaluation to fail.
 func (x *roundCowBase) lookup(addr basics.Address) (basics.AccountData, error) {
-	return x.l.LookupWithoutRewards(x.rnd, addr)
+	x.accountsMu.RLock()
+	if accountData, found := x.accounts[addr]; found {
+		x.accountsMu.RUnlock()
+		return accountData, nil
+	}
+	x.accountsMu.RUnlock()
+
+	accountData, _, err := x.l.LookupWithoutRewards(x.rnd, addr)
+	if err == nil {
+		x.accountsMu.Lock()
+		x.accounts[addr] = accountData
+		x.accountsMu.Unlock()
+	}
+	return accountData, err
 }
 
-func (x *roundCowBase) isDup(firstValid, lastValid basics.Round, txid transactions.Txid, txl txlease) (bool, error) {
-	return x.l.isDup(x.proto, x.rnd+1, firstValid, lastValid, txid, txl)
+func (x *roundCowBase) checkDup(firstValid, lastValid basics.Round, txid transactions.Txid, txl ledgercore.Txlease) error {
+	return x.l.CheckDup(x.proto, x.rnd+1, firstValid, lastValid, txid, TxLease{txl})
 }
 
 func (x *roundCowBase) txnCounter() uint64 {
 	return x.txnCount
 }
 
-// wrappers for roundCowState to satisfy the (current) apply.Balances interface
-func (cs *roundCowState) Get(addr basics.Address, withPendingRewards bool) (basics.BalanceRecord, error) {
-	acctdata, err := cs.lookup(addr)
+func (x *roundCowBase) compactCertNext() basics.Round {
+	return x.compactCertNextRnd
+}
+
+func (x *roundCowBase) blockHdr(r basics.Round) (bookkeeping.BlockHeader, error) {
+	return x.l.BlockHdr(r)
+}
+
+func (x *roundCowBase) allocated(addr basics.Address, aidx basics.AppIndex, global bool) (bool, error) {
+	acct, _, err := x.l.LookupWithoutRewards(x.rnd, addr)
 	if err != nil {
-		return basics.BalanceRecord{}, err
+		return false, err
+	}
+
+	// For global, check if app params exist
+	if global {
+		_, ok := acct.AppParams[aidx]
+		return ok, nil
+	}
+
+	// Otherwise, check app local states
+	_, ok := acct.AppLocalStates[aidx]
+	return ok, nil
+}
+
+// getKey gets the value for a particular key in some storage
+// associated with an application globally or locally
+func (x *roundCowBase) getKey(addr basics.Address, aidx basics.AppIndex, global bool, key string) (basics.TealValue, bool, error) {
+	ad, _, err := x.l.LookupWithoutRewards(x.rnd, addr)
+	if err != nil {
+		return basics.TealValue{}, false, err
+	}
+
+	exist := false
+	kv := basics.TealKeyValue{}
+	if global {
+		var app basics.AppParams
+		if app, exist = ad.AppParams[aidx]; exist {
+			kv = app.GlobalState
+		}
+	} else {
+		var ls basics.AppLocalState
+		if ls, exist = ad.AppLocalStates[aidx]; exist {
+			kv = ls.KeyValue
+		}
+	}
+	if !exist {
+		err = fmt.Errorf("cannot fetch key, %v", errNoStorage(addr, aidx, global))
+		return basics.TealValue{}, false, err
+	}
+
+	val, exist := kv[key]
+	return val, exist, nil
+}
+
+// getStorageCounts counts the storage types used by some account
+// associated with an application globally or locally
+func (x *roundCowBase) getStorageCounts(addr basics.Address, aidx basics.AppIndex, global bool) (basics.StateSchema, error) {
+	ad, _, err := x.l.LookupWithoutRewards(x.rnd, addr)
+	if err != nil {
+		return basics.StateSchema{}, err
+	}
+
+	count := basics.StateSchema{}
+	exist := false
+	kv := basics.TealKeyValue{}
+	if global {
+		var app basics.AppParams
+		if app, exist = ad.AppParams[aidx]; exist {
+			kv = app.GlobalState
+		}
+	} else {
+		var ls basics.AppLocalState
+		if ls, exist = ad.AppLocalStates[aidx]; exist {
+			kv = ls.KeyValue
+		}
+	}
+	if !exist {
+		return count, nil
+	}
+
+	for _, v := range kv {
+		if v.Type == basics.TealUintType {
+			count.NumUint++
+		} else {
+			count.NumByteSlice++
+		}
+	}
+	return count, nil
+}
+
+func (x *roundCowBase) getStorageLimits(addr basics.Address, aidx basics.AppIndex, global bool) (basics.StateSchema, error) {
+	creator, exists, err := x.getCreator(basics.CreatableIndex(aidx), basics.AppCreatable)
+	if err != nil {
+		return basics.StateSchema{}, err
+	}
+
+	// App doesn't exist, so no storage may be allocated.
+	if !exists {
+		return basics.StateSchema{}, nil
+	}
+
+	record, err := x.lookup(creator)
+	if err != nil {
+		return basics.StateSchema{}, err
+	}
+
+	params, ok := record.AppParams[aidx]
+	if !ok {
+		// This should never happen. If app exists then we should have
+		// found the creator successfully.
+		err = fmt.Errorf("app %d not found in account %s", aidx, creator.String())
+		return basics.StateSchema{}, err
+	}
+
+	if global {
+		return params.GlobalStateSchema, nil
+	}
+	return params.LocalStateSchema, nil
+}
+
+// wrappers for roundCowState to satisfy the (current) apply.Balances interface
+func (cs *roundCowState) Get(addr basics.Address, withPendingRewards bool) (basics.AccountData, error) {
+	acct, err := cs.lookup(addr)
+	if err != nil {
+		return basics.AccountData{}, err
 	}
 	if withPendingRewards {
-		acctdata = acctdata.WithUpdatedRewards(cs.proto, cs.rewardsLevel())
+		acct = acct.WithUpdatedRewards(cs.proto, cs.rewardsLevel())
 	}
-	return basics.BalanceRecord{Addr: addr, AccountData: acctdata}, nil
+	return acct, nil
 }
 
 func (cs *roundCowState) GetCreator(cidx basics.CreatableIndex, ctype basics.CreatableType) (basics.Address, bool, error) {
 	return cs.getCreator(cidx, ctype)
 }
 
-func (cs *roundCowState) Put(record basics.BalanceRecord) error {
-	return cs.PutWithCreatable(record, nil, nil)
+func (cs *roundCowState) Put(addr basics.Address, acct basics.AccountData) error {
+	return cs.PutWithCreatable(addr, acct, nil, nil)
 }
 
-func (cs *roundCowState) PutWithCreatable(record basics.BalanceRecord, newCreatable *basics.CreatableLocator, deletedCreatable *basics.CreatableLocator) error {
-	olddata, err := cs.lookup(record.Addr)
-	if err != nil {
-		return err
-	}
-	cs.put(record.Addr, olddata, record.AccountData, newCreatable, deletedCreatable)
+func (cs *roundCowState) PutWithCreatable(addr basics.Address, acct basics.AccountData, newCreatable *basics.CreatableLocator, deletedCreatable *basics.CreatableLocator) error {
+	cs.put(addr, acct, newCreatable, deletedCreatable)
 	return nil
 }
 
@@ -131,7 +279,7 @@ func (cs *roundCowState) Move(from basics.Address, to basics.Address, amt basics
 	if overflowed {
 		return fmt.Errorf("overspend (account %v, data %+v, tried to spend %v)", from, fromBal, amt)
 	}
-	cs.put(from, fromBal, fromBalNew, nil, nil)
+	cs.put(from, fromBalNew, nil, nil)
 
 	toBal, err := cs.lookup(to)
 	if err != nil {
@@ -152,13 +300,41 @@ func (cs *roundCowState) Move(from basics.Address, to basics.Address, amt basics
 	if overflowed {
 		return fmt.Errorf("balance overflow (account %v, data %+v, was going to receive %v)", to, toBal, amt)
 	}
-	cs.put(to, toBal, toBalNew, nil, nil)
+	cs.put(to, toBalNew, nil, nil)
 
 	return nil
 }
 
 func (cs *roundCowState) ConsensusParams() config.ConsensusParams {
 	return cs.proto
+}
+
+func (cs *roundCowState) compactCert(certRnd basics.Round, certType protocol.CompactCertType, cert compactcert.Cert, atRound basics.Round) error {
+	if certType != protocol.CompactCertBasic {
+		return fmt.Errorf("compact cert type %d not supported", certType)
+	}
+
+	nextCertRnd := cs.compactCertNext()
+
+	certHdr, err := cs.blockHdr(certRnd)
+	if err != nil {
+		return err
+	}
+
+	proto := config.Consensus[certHdr.CurrentProtocol]
+	votersRnd := certRnd.SubSaturate(basics.Round(proto.CompactCertRounds))
+	votersHdr, err := cs.blockHdr(votersRnd)
+	if err != nil {
+		return err
+	}
+
+	err = validateCompactCert(certHdr, cert, votersHdr, nextCertRnd, atRound)
+	if err != nil {
+		return err
+	}
+
+	cs.setCompactCertNext(certRnd + basics.Round(proto.CompactCertRounds))
+	return nil
 }
 
 // BlockEvaluator represents an in-progress evaluation of a block
@@ -181,12 +357,17 @@ type BlockEvaluator struct {
 }
 
 type ledgerForEvaluator interface {
+	ledgerForCowBase
 	GenesisHash() crypto.Digest
+	Totals(basics.Round) (ledgercore.AccountTotals, error)
+	CompactCertVoters(basics.Round) (*VotersForRound, error)
+}
+
+// ledgerForCowBase represents subset of Ledger functionality needed for cow business
+type ledgerForCowBase interface {
 	BlockHdr(basics.Round) (bookkeeping.BlockHeader, error)
-	Lookup(basics.Round, basics.Address) (basics.AccountData, error)
-	Totals(basics.Round) (AccountTotals, error)
-	isDup(config.ConsensusParams, basics.Round, basics.Round, basics.Round, transactions.Txid, txlease) (bool, error)
-	LookupWithoutRewards(basics.Round, basics.Address) (basics.AccountData, error)
+	CheckDup(config.ConsensusParams, basics.Round, basics.Round, basics.Round, transactions.Txid, TxLease) error
+	LookupWithoutRewards(basics.Round, basics.Address) (basics.AccountData, basics.Round, error)
 	GetCreatorForRound(basics.Round, basics.CreatableIndex, basics.CreatableType) (basics.Address, bool, error)
 }
 
@@ -210,8 +391,9 @@ func startEvaluator(l ledgerForEvaluator, hdr bookkeeping.BlockHeader, paysetHin
 		// the block at this round below, so underflow will be caught.
 		// If we are not validating, we must have previously checked
 		// an agreement.Certificate attesting that hdr is valid.
-		rnd:   hdr.Round - 1,
-		proto: proto,
+		rnd:      hdr.Round - 1,
+		proto:    proto,
+		accounts: make(map[basics.Address]basics.AccountData),
 	}
 
 	eval := &BlockEvaluator{
@@ -232,6 +414,8 @@ func startEvaluator(l ledgerForEvaluator, hdr bookkeeping.BlockHeader, paysetHin
 		eval.block.Payset = make([]transactions.SignedTxnInBlock, 0, paysetHint)
 	}
 
+	prevProto := proto
+
 	if hdr.Round > 0 {
 		var err error
 		eval.prevHeader, err = l.BlockHdr(base.rnd)
@@ -240,6 +424,23 @@ func startEvaluator(l ledgerForEvaluator, hdr bookkeeping.BlockHeader, paysetHin
 		}
 
 		base.txnCount = eval.prevHeader.TxnCounter
+		base.compactCertNextRnd = eval.prevHeader.CompactCert[protocol.CompactCertBasic].CompactCertNextRound
+		prevProto, ok = config.Consensus[eval.prevHeader.CurrentProtocol]
+		if !ok {
+			return nil, protocol.Error(eval.prevHeader.CurrentProtocol)
+		}
+
+		// Check if compact certs are being enabled as of this block.
+		if base.compactCertNextRnd == 0 && proto.CompactCertRounds != 0 {
+			// Determine the first block that will contain a Merkle
+			// commitment to the voters.  We need to account for the
+			// fact that the voters come from CompactCertVotersLookback
+			// rounds ago.
+			votersRound := (hdr.Round + basics.Round(proto.CompactCertVotersLookback)).RoundUpToMultipleOf(basics.Round(proto.CompactCertRounds))
+
+			// The first compact cert will appear CompactCertRounds after that.
+			base.compactCertNextRnd = votersRound + basics.Round(proto.CompactCertRounds)
+		}
 	}
 
 	prevTotals, err := l.Totals(eval.prevHeader.Round)
@@ -248,10 +449,14 @@ func startEvaluator(l ledgerForEvaluator, hdr bookkeeping.BlockHeader, paysetHin
 	}
 
 	poolAddr := eval.prevHeader.RewardsPool
-	incentivePoolData, err := l.Lookup(eval.prevHeader.Round, poolAddr)
+	// get the reward pool account data without any rewards
+	incentivePoolData, _, err := l.LookupWithoutRewards(eval.prevHeader.Round, poolAddr)
 	if err != nil {
 		return nil, err
 	}
+
+	// this is expected to be a no-op, but update the rewards on the rewards pool if it was configured to receive rewards ( unlike mainnet ).
+	incentivePoolData = incentivePoolData.WithUpdatedRewards(prevProto, eval.prevHeader.RewardsLevel)
 
 	if generate {
 		if eval.proto.SupportGenesisHash {
@@ -260,7 +465,7 @@ func startEvaluator(l ledgerForEvaluator, hdr bookkeeping.BlockHeader, paysetHin
 		eval.block.BlockHeader.RewardsState = eval.prevHeader.NextRewardsState(hdr.Round, proto, incentivePoolData.MicroAlgos, prevTotals.RewardUnits())
 	}
 	// set the eval state with the current header
-	eval.state = makeRoundCowState(base, eval.block.BlockHeader)
+	eval.state = makeRoundCowState(base, eval.block.BlockHeader, eval.prevHeader.TimeStamp, paysetHint)
 
 	if validate {
 		err := eval.block.BlockHeader.PreCheck(eval.prevHeader)
@@ -305,7 +510,7 @@ func startEvaluator(l ledgerForEvaluator, hdr bookkeeping.BlockHeader, paysetHin
 		return nil, fmt.Errorf("overflowed subtracting reward unit for block %v", hdr.Round)
 	}
 
-	err = eval.state.Put(poolNew)
+	err = eval.state.Put(poolAddr, poolNew)
 	if err != nil {
 		return nil, err
 	}
@@ -322,7 +527,7 @@ func startEvaluator(l ledgerForEvaluator, hdr bookkeeping.BlockHeader, paysetHin
 
 // hotfix for testnet stall 08/26/2019; move some algos from testnet bank to rewards pool to give it enough time until protocol upgrade occur.
 // hotfix for testnet stall 11/07/2019; do the same thing
-func (eval *BlockEvaluator) workaroundOverspentRewards(rewardPoolBalance basics.BalanceRecord, headerRound basics.Round) (poolOld basics.BalanceRecord, err error) {
+func (eval *BlockEvaluator) workaroundOverspentRewards(rewardPoolBalance basics.AccountData, headerRound basics.Round) (poolOld basics.AccountData, err error) {
 	// verify that we patch the correct round.
 	if headerRound != 1499995 && headerRound != 2926564 {
 		return rewardPoolBalance, nil
@@ -344,6 +549,11 @@ func (eval *BlockEvaluator) workaroundOverspentRewards(rewardPoolBalance basics.
 	poolOld, err = eval.state.Get(eval.prevHeader.RewardsPool, true)
 
 	return
+}
+
+// TxnCounter returns the number of transactions that have been added to the block evaluator so far.
+func (eval *BlockEvaluator) TxnCounter() int {
+	return len(eval.block.Payset)
 }
 
 // Round returns the round number of the block being evaluated by the BlockEvaluator.
@@ -429,12 +639,9 @@ func (eval *BlockEvaluator) testTransaction(txn transactions.SignedTxn, cow *rou
 
 	// Transaction already in the ledger?
 	txid := txn.ID()
-	dup, err := cow.isDup(txn.Txn.First(), txn.Txn.Last(), txid, txlease{sender: txn.Txn.Sender, lease: txn.Txn.Lease})
+	err = cow.checkDup(txn.Txn.First(), txn.Txn.Last(), txid, ledgercore.Txlease{Sender: txn.Txn.Sender, Lease: txn.Txn.Lease})
 	if err != nil {
 		return err
-	}
-	if dup {
-		return TransactionInLedgerError{txn.ID()}
 	}
 
 	return nil
@@ -445,7 +652,7 @@ func (eval *BlockEvaluator) testTransaction(txn transactions.SignedTxn, cow *rou
 // an error is returned and the block evaluator state is unchanged.
 func (eval *BlockEvaluator) Transaction(txn transactions.SignedTxn, ad transactions.ApplyData) error {
 	return eval.transactionGroup([]transactions.SignedTxnWithAD{
-		transactions.SignedTxnWithAD{
+		{
 			SignedTxn: txn,
 			ApplyData: ad,
 		},
@@ -459,12 +666,12 @@ func (eval *BlockEvaluator) TransactionGroup(txads []transactions.SignedTxnWithA
 	return eval.transactionGroup(txads)
 }
 
-// prepareAppEvaluators creates appTealEvaluators for each ApplicationCall
+// prepareEvalParams creates a logic.EvalParams for each ApplicationCall
 // transaction in the group
-func (eval *BlockEvaluator) prepareAppEvaluators(txgroup []transactions.SignedTxnWithAD) (res []*appTealEvaluator) {
+func (eval *BlockEvaluator) prepareEvalParams(txgroup []transactions.SignedTxnWithAD) (res []*logic.EvalParams) {
 	var groupNoAD []transactions.SignedTxn
 	var minTealVersion uint64
-	res = make([]*appTealEvaluator, len(txgroup))
+	res = make([]*logic.EvalParams, len(txgroup))
 	for i, txn := range txgroup {
 		// Ignore any non-ApplicationCall transactions
 		if txn.SignedTxn.Txn.Type != protocol.ApplicationCallTx {
@@ -480,23 +687,13 @@ func (eval *BlockEvaluator) prepareAppEvaluators(txgroup []transactions.SignedTx
 			minTealVersion = logic.ComputeMinTealVersion(groupNoAD)
 		}
 
-		// Construct an appTealEvaluator (implements
-		// apply.StateEvaluator) for use in ApplicationCall transactions.
-		steva := appTealEvaluator{
-			evalParams: logic.EvalParams{
-				Txn:            &groupNoAD[i],
-				Proto:          &eval.proto,
-				TxnGroup:       groupNoAD,
-				GroupIndex:     i,
-				MinTealVersion: &minTealVersion,
-			},
-			AppTealGlobals: AppTealGlobals{
-				CurrentRound:    eval.prevHeader.Round + 1,
-				LatestTimestamp: eval.prevHeader.TimeStamp,
-			},
+		res[i] = &logic.EvalParams{
+			Txn:            &groupNoAD[i],
+			Proto:          &eval.proto,
+			TxnGroup:       groupNoAD,
+			GroupIndex:     i,
+			MinTealVersion: &minTealVersion,
 		}
-
-		res[i] = &steva
 	}
 	return
 }
@@ -520,15 +717,15 @@ func (eval *BlockEvaluator) transactionGroup(txgroup []transactions.SignedTxnWit
 
 	cow := eval.state.child()
 
-	// Prepare TEAL contexts for any ApplicationCall transactions in the group
-	appEvaluators := eval.prepareAppEvaluators(txgroup)
+	// Prepare eval params for any ApplicationCall transactions in the group
+	evalParams := eval.prepareEvalParams(txgroup)
 
 	// Evaluate each transaction in the group
 	txibs = make([]transactions.SignedTxnInBlock, 0, len(txgroup))
 	for gi, txad := range txgroup {
 		var txib transactions.SignedTxnInBlock
 
-		err := eval.transaction(txad.SignedTxn, appEvaluators[gi], txad.ApplyData, cow, &txib)
+		err := eval.transaction(txad.SignedTxn, evalParams[gi], txad.ApplyData, cow, &txib)
 		if err != nil {
 			return err
 		}
@@ -536,7 +733,7 @@ func (eval *BlockEvaluator) transactionGroup(txgroup []transactions.SignedTxnWit
 		txibs = append(txibs, txib)
 
 		if eval.validate {
-			groupTxBytes += len(protocol.Encode(&txib))
+			groupTxBytes += txib.GetEncodedLength()
 			if eval.blockTxBytes+groupTxBytes > eval.proto.MaxTxnBytesPerBlock {
 				return ErrNoSpace
 			}
@@ -576,7 +773,7 @@ func (eval *BlockEvaluator) transactionGroup(txgroup []transactions.SignedTxnWit
 // transaction tentatively executes a new transaction as part of this block evaluation.
 // If the transaction cannot be added to the block without violating some constraints,
 // an error is returned and the block evaluator state is unchanged.
-func (eval *BlockEvaluator) transaction(txn transactions.SignedTxn, appEval *appTealEvaluator, ad transactions.ApplyData, cow *roundCowState, txib *transactions.SignedTxnInBlock) error {
+func (eval *BlockEvaluator) transaction(txn transactions.SignedTxn, evalParams *logic.EvalParams, ad transactions.ApplyData, cow *roundCowState, txib *transactions.SignedTxnInBlock) error {
 	var err error
 
 	// Only compute the TxID once
@@ -589,12 +786,9 @@ func (eval *BlockEvaluator) transaction(txn transactions.SignedTxn, appEval *app
 		}
 
 		// Transaction already in the ledger?
-		dup, err := cow.isDup(txn.Txn.First(), txn.Txn.Last(), txid, txlease{sender: txn.Txn.Sender, lease: txn.Txn.Lease})
+		err := cow.checkDup(txn.Txn.First(), txn.Txn.Last(), txid, ledgercore.Txlease{Sender: txn.Txn.Sender, Lease: txn.Txn.Lease})
 		if err != nil {
 			return err
-		}
-		if dup {
-			return TransactionInLedgerError{txid}
 		}
 
 		// Does the address that authorized the transaction actually match whatever address the sender has rekeyed to?
@@ -618,7 +812,7 @@ func (eval *BlockEvaluator) transaction(txn transactions.SignedTxn, appEval *app
 	}
 
 	// Apply the transaction, updating the cow balances
-	applyData, err := applyTransaction(txn.Txn, cow, appEval, spec, cow.txnCounter())
+	applyData, err := applyTransaction(txn.Txn, cow, evalParams, spec, cow.txnCounter())
 	if err != nil {
 		return fmt.Errorf("transaction %v: %v", txid, err)
 	}
@@ -647,11 +841,11 @@ func (eval *BlockEvaluator) transaction(txn transactions.SignedTxn, appEval *app
 	// completely zero, which means the account will be deleted.)
 	rewardlvl := cow.rewardsLevel()
 	for _, addr := range cow.modifiedAccounts() {
-		// Skip FeeSink and RewardsPool MinBalance checks here.
-		// There's only two accounts, so space isn't an issue, and we don't
+		// Skip FeeSink, RewardsPool, and CompactCertSender MinBalance checks here.
+		// There's only a few accounts, so space isn't an issue, and we don't
 		// expect them to have low balances, but if they do, it may cause
-		// surprises for every transaction.
-		if addr == spec.FeeSink || addr == spec.RewardsPool {
+		// surprises.
+		if addr == spec.FeeSink || addr == spec.RewardsPool || addr == transactions.CompactCertSender {
 			continue
 		}
 
@@ -689,7 +883,7 @@ func (eval *BlockEvaluator) transaction(txn transactions.SignedTxn, appEval *app
 }
 
 // applyTransaction changes the balances according to this transaction.
-func applyTransaction(tx transactions.Transaction, balances apply.Balances, steva apply.StateEvaluator, spec transactions.SpecialAddresses, ctr uint64) (ad transactions.ApplyData, err error) {
+func applyTransaction(tx transactions.Transaction, balances *roundCowState, evalParams *logic.EvalParams, spec transactions.SpecialAddresses, ctr uint64) (ad transactions.ApplyData, err error) {
 	params := balances.ConsensusParams()
 
 	// move fee to pool
@@ -700,20 +894,20 @@ func applyTransaction(tx transactions.Transaction, balances apply.Balances, stev
 
 	// rekeying: update balrecord.AuthAddr to tx.RekeyTo if provided
 	if (tx.RekeyTo != basics.Address{}) {
-		var record basics.BalanceRecord
-		record, err = balances.Get(tx.Sender, false)
+		var acct basics.AccountData
+		acct, err = balances.Get(tx.Sender, false)
 		if err != nil {
 			return
 		}
-		// Special case: rekeying to the account's actual address just sets balrecord.AuthAddr to 0
+		// Special case: rekeying to the account's actual address just sets acct.AuthAddr to 0
 		// This saves 32 bytes in your balance record if you want to go back to using your original key
 		if tx.RekeyTo == tx.Sender {
-			record.AuthAddr = basics.Address{}
+			acct.AuthAddr = basics.Address{}
 		} else {
-			record.AuthAddr = tx.RekeyTo
+			acct.AuthAddr = tx.RekeyTo
 		}
 
-		err = balances.Put(record)
+		err = balances.Put(tx.Sender, acct)
 		if err != nil {
 			return
 		}
@@ -736,7 +930,10 @@ func applyTransaction(tx transactions.Transaction, balances apply.Balances, stev
 		err = apply.AssetFreeze(tx.AssetFreezeTxnFields, tx.Header, balances, spec, &ad)
 
 	case protocol.ApplicationCallTx:
-		err = apply.ApplicationCall(tx.ApplicationCallTxnFields, tx.Header, balances, &ad, ctr, steva)
+		err = apply.ApplicationCall(tx.ApplicationCallTxnFields, tx.Header, balances, &ad, evalParams, ctr)
+
+	case protocol.CompactCertTx:
+		err = balances.compactCert(tx.CertRound, tx.CertType, tx.Cert, tx.Header.FirstValid)
 
 	default:
 		err = fmt.Errorf("Unknown transaction type %v", tx.Type)
@@ -753,14 +950,57 @@ func applyTransaction(tx transactions.Transaction, balances apply.Balances, stev
 	return
 }
 
+// compactCertVotersAndTotal returns the expected values of CompactCertVoters
+// and CompactCertVotersTotal for a block.
+func (eval *BlockEvaluator) compactCertVotersAndTotal() (root crypto.Digest, total basics.MicroAlgos, err error) {
+	if eval.proto.CompactCertRounds == 0 {
+		return
+	}
+
+	if eval.block.Round()%basics.Round(eval.proto.CompactCertRounds) != 0 {
+		return
+	}
+
+	lookback := eval.block.Round().SubSaturate(basics.Round(eval.proto.CompactCertVotersLookback))
+	voters, err := eval.l.CompactCertVoters(lookback)
+	if err != nil {
+		return
+	}
+
+	if voters != nil {
+		root = voters.Tree.Root()
+		total = voters.TotalWeight
+	}
+
+	return
+}
+
 // Call "endOfBlock" after all the block's rewards and transactions are processed.
 func (eval *BlockEvaluator) endOfBlock() error {
 	if eval.generate {
-		eval.block.TxnRoot = eval.block.Payset.Commit(eval.proto.PaysetCommitFlat)
+		var err error
+		eval.block.TxnRoot, err = eval.block.PaysetCommit()
+		if err != nil {
+			return err
+		}
+
 		if eval.proto.TxnCounter {
 			eval.block.TxnCounter = eval.state.txnCounter()
 		} else {
 			eval.block.TxnCounter = 0
+		}
+
+		if eval.proto.CompactCertRounds > 0 {
+			var basicCompactCert bookkeeping.CompactCertState
+			basicCompactCert.CompactCertVoters, basicCompactCert.CompactCertVotersTotal, err = eval.compactCertVotersAndTotal()
+			if err != nil {
+				return err
+			}
+
+			basicCompactCert.CompactCertNextRound = eval.state.compactCertNext()
+
+			eval.block.CompactCert = make(map[protocol.CompactCertType]bookkeeping.CompactCertState)
+			eval.block.CompactCert[protocol.CompactCertBasic] = basicCompactCert
 		}
 	}
 
@@ -771,7 +1011,10 @@ func (eval *BlockEvaluator) endOfBlock() error {
 func (eval *BlockEvaluator) finalValidation() error {
 	if eval.validate {
 		// check commitments
-		txnRoot := eval.block.Payset.Commit(eval.proto.PaysetCommitFlat)
+		txnRoot, err := eval.block.PaysetCommit()
+		if err != nil {
+			return err
+		}
 		if txnRoot != eval.block.TxnRoot {
 			return fmt.Errorf("txn root wrong: %v != %v", txnRoot, eval.block.TxnRoot)
 		}
@@ -782,6 +1025,25 @@ func (eval *BlockEvaluator) finalValidation() error {
 		}
 		if eval.block.TxnCounter != expectedTxnCount {
 			return fmt.Errorf("txn count wrong: %d != %d", eval.block.TxnCounter, expectedTxnCount)
+		}
+
+		expectedVoters, expectedVotersWeight, err := eval.compactCertVotersAndTotal()
+		if err != nil {
+			return err
+		}
+		if eval.block.CompactCert[protocol.CompactCertBasic].CompactCertVoters != expectedVoters {
+			return fmt.Errorf("CompactCertVoters wrong: %v != %v", eval.block.CompactCert[protocol.CompactCertBasic].CompactCertVoters, expectedVoters)
+		}
+		if eval.block.CompactCert[protocol.CompactCertBasic].CompactCertVotersTotal != expectedVotersWeight {
+			return fmt.Errorf("CompactCertVotersTotal wrong: %v != %v", eval.block.CompactCert[protocol.CompactCertBasic].CompactCertVotersTotal, expectedVotersWeight)
+		}
+		if eval.block.CompactCert[protocol.CompactCertBasic].CompactCertNextRound != eval.state.compactCertNext() {
+			return fmt.Errorf("CompactCertNextRound wrong: %v != %v", eval.block.CompactCert[protocol.CompactCertBasic].CompactCertNextRound, eval.state.compactCertNext())
+		}
+		for ccType := range eval.block.CompactCert {
+			if ccType != protocol.CompactCertBasic {
+				return fmt.Errorf("CompactCertType %d unexpected", ccType)
+			}
 		}
 	}
 
@@ -816,156 +1078,179 @@ func (eval *BlockEvaluator) GenerateBlock() (*ValidatedBlock, error) {
 
 	vb := ValidatedBlock{
 		blk:   eval.block,
-		delta: eval.state.mods,
+		delta: eval.state.deltas(),
 	}
 	eval.blockGenerated = true
-	eval.state = makeRoundCowState(eval.state, eval.block.BlockHeader)
+	eval.state = makeRoundCowState(eval.state, eval.block.BlockHeader, eval.prevHeader.TimeStamp, len(eval.block.Payset))
 	return &vb, nil
 }
 
 type evalTxValidator struct {
-	txcache          VerifiedTxnCache
+	txcache          verify.VerifiedTransactionCache
 	block            bookkeeping.Block
-	proto            config.ConsensusParams
 	verificationPool execpool.BacklogPool
 
 	ctx      context.Context
-	cf       context.CancelFunc
-	txgroups chan []transactions.SignedTxnWithAD
+	txgroups [][]transactions.SignedTxnWithAD
 	done     chan error
 }
 
 func (validator *evalTxValidator) run() {
-	for txgroup := range validator.txgroups {
-		select {
-		case <-validator.ctx.Done():
-			validator.done <- validator.ctx.Err()
-			validator.cf()
-			close(validator.done)
-			return
-		default:
-		}
-		groupNoAD := make([]transactions.SignedTxn, len(txgroup))
-		for i := range txgroup {
-			groupNoAD[i] = txgroup[i].SignedTxn
-		}
-		ctxs := verify.PrepareContexts(groupNoAD, validator.block.BlockHeader)
+	defer close(validator.done)
+	specialAddresses := transactions.SpecialAddresses{
+		FeeSink:     validator.block.BlockHeader.FeeSink,
+		RewardsPool: validator.block.BlockHeader.RewardsPool,
+	}
 
-		for gi, tx := range txgroup {
-			err := validateTransaction(tx.SignedTxn, validator.block, validator.proto, validator.txcache, ctxs[gi], validator.verificationPool)
+	var unverifiedTxnGroups [][]transactions.SignedTxn
+	unverifiedTxnGroups = make([][]transactions.SignedTxn, 0, len(validator.txgroups))
+	for _, group := range validator.txgroups {
+		signedTxnGroup := make([]transactions.SignedTxn, len(group))
+		for j, txn := range group {
+			signedTxnGroup[j] = txn.SignedTxn
+			err := txn.SignedTxn.Txn.Alive(validator.block)
 			if err != nil {
 				validator.done <- err
-				validator.cf()
-				close(validator.done)
 				return
 			}
 		}
+		unverifiedTxnGroups = append(unverifiedTxnGroups, signedTxnGroup)
 	}
-	close(validator.done)
-}
 
-func validateTransaction(txn transactions.SignedTxn, block bookkeeping.Block, proto config.ConsensusParams, txcache VerifiedTxnCache, ctx verify.Context, verificationPool execpool.BacklogPool) error {
-	// Transaction valid (not expired)?
-	err := txn.Txn.Alive(block)
+	unverifiedTxnGroups = validator.txcache.GetUnverifiedTranscationGroups(unverifiedTxnGroups, specialAddresses, validator.block.BlockHeader.CurrentProtocol)
+
+	err := verify.PaysetGroups(validator.ctx, unverifiedTxnGroups, validator.block.BlockHeader, validator.verificationPool, validator.txcache)
 	if err != nil {
-		return err
+		validator.done <- err
 	}
-
-	if txcache == nil || !txcache.Verified(txn, ctx.Params) {
-		err = verify.TxnPool(&txn, ctx, verificationPool)
-		if err != nil {
-			return fmt.Errorf("transaction %v: failed to verify: %v", txn.ID(), err)
-		}
-	}
-	return nil
 }
 
 // used by Ledger.Validate() Ledger.AddBlock() Ledger.trackerEvalVerified()(accountUpdates.loadFromDisk())
 //
-// Validate: eval(ctx, blk, true, txcache, executionPool)
-// AddBlock: eval(context.Background(), blk, false, nil, nil)
-// tracker:  eval(context.Background(), blk, false, nil, nil)
-func eval(ctx context.Context, l ledgerForEvaluator, blk bookkeeping.Block, validate bool, txcache VerifiedTxnCache, executionPool execpool.BacklogPool) (StateDelta, error) {
+// Validate: eval(ctx, l, blk, true, txcache, executionPool, true)
+// AddBlock: eval(context.Background(), l, blk, false, txcache, nil, true)
+// tracker:  eval(context.Background(), l, blk, false, txcache, nil, false)
+func eval(ctx context.Context, l ledgerForEvaluator, blk bookkeeping.Block, validate bool, txcache verify.VerifiedTransactionCache, executionPool execpool.BacklogPool, usePrefetch bool) (ledgercore.StateDelta, error) {
 	eval, err := startEvaluator(l, blk.BlockHeader, len(blk.Payset), validate, false)
 	if err != nil {
-		return StateDelta{}, err
+		return ledgercore.StateDelta{}, err
+	}
+
+	validationCtx, validationCancel := context.WithCancel(ctx)
+	var wg sync.WaitGroup
+	defer func() {
+		validationCancel()
+		wg.Wait()
+	}()
+
+	// If validationCtx or underlying ctx are Done, end prefetch
+	if usePrefetch {
+		wg.Add(1)
+		go prefetchThread(validationCtx, eval.state.lookupParent, blk.Payset, &wg)
 	}
 
 	// Next, transactions
 	paysetgroups, err := blk.DecodePaysetGroups()
 	if err != nil {
-		return StateDelta{}, err
+		return ledgercore.StateDelta{}, err
 	}
-
 	var txvalidator evalTxValidator
-	ctx, cf := context.WithCancel(ctx)
-	defer cf()
 	if validate {
-		proto, ok := config.Consensus[blk.CurrentProtocol]
+		_, ok := config.Consensus[blk.CurrentProtocol]
 		if !ok {
-			return StateDelta{}, protocol.Error(blk.CurrentProtocol)
+			return ledgercore.StateDelta{}, protocol.Error(blk.CurrentProtocol)
 		}
 		txvalidator.txcache = txcache
 		txvalidator.block = blk
-		txvalidator.proto = proto
 		txvalidator.verificationPool = executionPool
 
-		txvalidator.ctx = ctx
-		txvalidator.cf = cf
-		txvalidator.txgroups = make(chan []transactions.SignedTxnWithAD, len(paysetgroups))
+		txvalidator.ctx = validationCtx
+		txvalidator.txgroups = paysetgroups
 		txvalidator.done = make(chan error, 1)
 		go txvalidator.run()
+
 	}
 
 	for _, txgroup := range paysetgroups {
 		select {
 		case <-ctx.Done():
-			select {
-			case err := <-txvalidator.done:
-				return StateDelta{}, err
-			default:
+			return ledgercore.StateDelta{}, ctx.Err()
+		case err, open := <-txvalidator.done:
+			// if we're not validating, then `txvalidator.done` would be nil, in which case this case statement would never be executed.
+			if open && err != nil {
+				return ledgercore.StateDelta{}, err
 			}
-			return StateDelta{}, ctx.Err()
 		default:
 		}
 
-		if validate {
-			txvalidator.txgroups <- txgroup
-		}
 		err = eval.TransactionGroup(txgroup)
 		if err != nil {
-			return StateDelta{}, err
+			return ledgercore.StateDelta{}, err
 		}
 	}
 
 	// Finally, procees any pending end-of-block state changes
 	err = eval.endOfBlock()
 	if err != nil {
-		return StateDelta{}, err
+		return ledgercore.StateDelta{}, err
 	}
 
 	// If validating, do final block checks that depend on our new state
 	if validate {
-		close(txvalidator.txgroups)
-		err, gotErr := <-txvalidator.done
-		if gotErr && err != nil {
-			return StateDelta{}, err
+		// wait for the validation to complete.
+		select {
+		case <-ctx.Done():
+			return ledgercore.StateDelta{}, ctx.Err()
+		case err, open := <-txvalidator.done:
+			if !open {
+				break
+			}
+			if err != nil {
+				return ledgercore.StateDelta{}, err
+			}
 		}
 		err = eval.finalValidation()
 		if err != nil {
-			return StateDelta{}, err
+			return ledgercore.StateDelta{}, err
 		}
 	}
 
-	return eval.state.mods, nil
+	return eval.state.deltas(), nil
+}
+
+func prefetchThread(ctx context.Context, state roundCowParent, payset []transactions.SignedTxnInBlock, wg *sync.WaitGroup) {
+	defer wg.Done()
+	maybelookup := func(addr basics.Address) {
+		if addr.IsZero() {
+			return
+		}
+		state.lookup(addr)
+	}
+	for _, stxn := range payset {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		state.lookup(stxn.Txn.Sender)
+		maybelookup(stxn.Txn.Receiver)
+		maybelookup(stxn.Txn.CloseRemainderTo)
+		maybelookup(stxn.Txn.AssetSender)
+		maybelookup(stxn.Txn.AssetReceiver)
+		maybelookup(stxn.Txn.AssetCloseTo)
+		maybelookup(stxn.Txn.FreezeAccount)
+		for _, xa := range stxn.Txn.Accounts {
+			maybelookup(xa)
+		}
+	}
 }
 
 // Validate uses the ledger to validate block blk as a candidate next block.
 // It returns an error if blk is not the expected next block, or if blk is
 // not a valid block (e.g., it has duplicate transactions, overspends some
 // account, etc).
-func (l *Ledger) Validate(ctx context.Context, blk bookkeeping.Block, txcache VerifiedTxnCache, executionPool execpool.BacklogPool) (*ValidatedBlock, error) {
-	delta, err := eval(ctx, l, blk, true, txcache, executionPool)
+func (l *Ledger) Validate(ctx context.Context, blk bookkeeping.Block, executionPool execpool.BacklogPool) (*ValidatedBlock, error) {
+	delta, err := eval(ctx, l, blk, true, l.verifiedTxnCache, executionPool, true)
 	if err != nil {
 		return nil, err
 	}
@@ -982,7 +1267,7 @@ func (l *Ledger) Validate(ctx context.Context, blk bookkeeping.Block, txcache Ve
 // the work of applying the block's changes to the ledger state.
 type ValidatedBlock struct {
 	blk   bookkeeping.Block
-	delta StateDelta
+	delta ledgercore.StateDelta
 }
 
 // Block returns the underlying Block for a ValidatedBlock.

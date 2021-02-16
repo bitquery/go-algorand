@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -21,7 +21,6 @@ import (
 	"io/ioutil"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"github.com/algorand/go-algorand/protocol"
@@ -137,12 +136,17 @@ type ConsensusParams struct {
 	DownCommitteeSize      uint64
 	DownCommitteeThreshold uint64
 
+	// time for nodes to wait for block proposal headers for period > 0, value should be set to 2 * SmallLambda
+	AgreementFilterTimeout time.Duration
+	// time for nodes to wait for block proposal headers for period = 0, value should be configured to suit best case
+	// critical path
+	AgreementFilterTimeoutPeriod0 time.Duration
+
 	FastRecoveryLambda    time.Duration // time between fast recovery attempts
 	FastPartitionRecovery bool          // set when fast partition recovery is enabled
 
-	// commit to payset using a hash of entire payset,
-	// instead of txid merkle tree
-	PaysetCommitFlat bool
+	// how to commit to the payset: flat or merkle tree
+	PaysetCommit PaysetCommitType
 
 	MaxTimestampIncrement int64 // maximum time between timestamps on successive blocks
 
@@ -292,7 +296,70 @@ type ConsensusParams struct {
 	// maximum total minimum balance requirement for an account, used
 	// to limit the maximum size of a single balance record
 	MaximumMinimumBalance uint64
+
+	// CompactCertRounds defines the frequency with which compact
+	// certificates are generated.  Every round that is a multiple
+	// of CompactCertRounds, the block header will include a Merkle
+	// commitment to the set of online accounts (that can vote after
+	// another CompactCertRounds rounds), and that block will be signed
+	// (forming a compact certificate) by the voters from the previous
+	// such Merkle tree commitment.  A value of zero means no compact
+	// certificates.
+	CompactCertRounds uint64
+
+	// CompactCertTopVoters is a bound on how many online accounts get to
+	// participate in forming the compact certificate, by including the
+	// top CompactCertTopVoters accounts (by normalized balance) into the
+	// Merkle commitment.
+	CompactCertTopVoters uint64
+
+	// CompactCertVotersLookback is the number of blocks we skip before
+	// publishing a Merkle commitment to the online accounts.  Namely,
+	// if block number N contains a Merkle commitment to the online
+	// accounts (which, incidentally, means N%CompactCertRounds=0),
+	// then the balances reflected in that commitment must come from
+	// block N-CompactCertVotersLookback.  This gives each node some
+	// time (CompactCertVotersLookback blocks worth of time) to
+	// construct this Merkle tree, so as to avoid placing the
+	// construction of this Merkle tree (and obtaining the requisite
+	// accounts and balances) in the critical path.
+	CompactCertVotersLookback uint64
+
+	// CompactCertWeightThreshold specifies the fraction of top voters weight
+	// that must sign the message (block header) for security.  The compact
+	// certificate ensures this threshold holds; however, forming a valid
+	// compact certificate requires a somewhat higher number of signatures,
+	// and the more signatures are collected, the smaller the compact cert
+	// can be.
+	//
+	// This threshold can be thought of as the maximum fraction of
+	// malicious weight that compact certificates defend against.
+	//
+	// The threshold is computed as CompactCertWeightThreshold/(1<<32).
+	CompactCertWeightThreshold uint32
+
+	// CompactCertSecKQ is the security parameter (k+q) for the compact
+	// certificate scheme.
+	CompactCertSecKQ uint64
+
+	// EnableAssetCloseAmount adds an extra field to the ApplyData. The field contains the amount of the remaining
+	// asset that were sent to the close-to address.
+	EnableAssetCloseAmount bool
 }
+
+// PaysetCommitType enumerates possible ways for the block header to commit to
+// the set of transactions in the block.
+type PaysetCommitType int
+
+const (
+	// PaysetCommitUnsupported is the zero value, reflecting the fact
+	// that some early protocols used a Merkle tree to commit to the
+	// transactions in a way that we no longer support.
+	PaysetCommitUnsupported PaysetCommitType = iota
+
+	// PaysetCommitFlat hashes the entire payset array.
+	PaysetCommitFlat
+)
 
 // ConsensusProtocols defines a set of supported protocol versions and their
 // corresponding parameters.
@@ -330,6 +397,10 @@ var MaxTxGroupSize int
 // of the consensus protocols. used for decoding purposes.
 var MaxAppProgramLen int
 
+// MaxBytesKeyValueLen is a maximum length of key or value across all protocols.
+// used for decoding purposes.
+var MaxBytesKeyValueLen int
+
 func checkSetMax(value int, curMax *int) {
 	if value > *curMax {
 		*curMax = value
@@ -356,12 +427,25 @@ func checkSetAllocBounds(p ConsensusParams) {
 	checkSetMax(int(p.LogicSigMaxSize), &MaxLogicSigMaxSize)
 	checkSetMax(p.MaxTxnNoteBytes, &MaxTxnNoteBytes)
 	checkSetMax(p.MaxTxGroupSize, &MaxTxGroupSize)
+	// MaxBytesKeyValueLen is max of MaxAppKeyLen and MaxAppBytesValueLen
+	checkSetMax(p.MaxAppKeyLen, &MaxBytesKeyValueLen)
+	checkSetMax(p.MaxAppBytesValueLen, &MaxBytesKeyValueLen)
 }
 
 // SaveConfigurableConsensus saves the configurable protocols file to the provided data directory.
+// if the params contains zero protocols, the existing consensus.json file will be removed if exists.
 func SaveConfigurableConsensus(dataDirectory string, params ConsensusProtocols) error {
 	consensusProtocolPath := filepath.Join(dataDirectory, ConfigurableConsensusProtocolsFilename)
 
+	if len(params) == 0 {
+		// we have no consensus params to write. In this case, just delete the existing file
+		// ( if any )
+		err := os.Remove(consensusProtocolPath)
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
 	encodedConsensusParams, err := json.Marshal(params)
 	if err != nil {
 		return err
@@ -493,6 +577,9 @@ func initConsensusProtocols() {
 		DownCommitteeSize:      10000,
 		DownCommitteeThreshold: 7750,
 
+		AgreementFilterTimeout:        4 * time.Second,
+		AgreementFilterTimeoutPeriod0: 4 * time.Second,
+
 		FastRecoveryLambda: 5 * time.Minute,
 
 		SeedLookback:        2,
@@ -558,7 +645,7 @@ func initConsensusProtocols() {
 	// v11 introduces SignedTxnInBlock.
 	v11 := v10
 	v11.SupportSignedTxnInBlock = true
-	v11.PaysetCommitFlat = true
+	v11.PaysetCommit = PaysetCommitFlat
 	v11.ApprovedUpgrades = map[protocol.ConsensusVersion]uint64{}
 	Consensus[protocol.ConsensusV11] = v11
 
@@ -752,10 +839,31 @@ func initConsensusProtocols() {
 	// v23 can be upgraded to v24, with an update delay of 7 days ( see calculation above )
 	v23.ApprovedUpgrades[protocol.ConsensusV24] = 140000
 
+	// v25 enables AssetCloseAmount in the ApplyData
+	v25 := v24
+	v25.ApprovedUpgrades = map[protocol.ConsensusVersion]uint64{}
+
+	// Enable AssetCloseAmount field
+	v25.EnableAssetCloseAmount = true
+	Consensus[protocol.ConsensusV25] = v25
+
+	// v24 can be upgraded to v25, with an update delay of 7 days ( see calculation above )
+	v24.ApprovedUpgrades[protocol.ConsensusV25] = 140000
+
 	// ConsensusFuture is used to test features that are implemented
 	// but not yet released in a production protocol version.
-	vFuture := v24
+	vFuture := v25
 	vFuture.ApprovedUpgrades = map[protocol.ConsensusVersion]uint64{}
+
+	// FilterTimeout for period 0 should take a new optimized, configured value, need to revisit this later
+	vFuture.AgreementFilterTimeoutPeriod0 = 4 * time.Second
+
+	// Enable compact certificates.
+	vFuture.CompactCertRounds = 128
+	vFuture.CompactCertTopVoters = 1024 * 1024
+	vFuture.CompactCertVotersLookback = 16
+	vFuture.CompactCertWeightThreshold = (1 << 32) * 30 / 100
+	vFuture.CompactCertSecKQ = 128
 
 	Consensus[protocol.ConsensusFuture] = vFuture
 }
@@ -777,15 +885,6 @@ func init() {
 	Consensus = make(ConsensusProtocols)
 
 	initConsensusProtocols()
-
-	// Allow tuning SmallLambda for faster consensus in single-machine e2e
-	// tests.  Useful for development.  This might make sense to fold into
-	// a protocol-version-specific setting, once we move SmallLambda into
-	// ConsensusParams.
-	algoSmallLambda, err := strconv.ParseInt(os.Getenv("ALGOSMALLLAMBDAMSEC"), 10, 64)
-	if err == nil {
-		Protocol.SmallLambda = time.Duration(algoSmallLambda) * time.Millisecond
-	}
 
 	// Set allocation limits
 	for _, p := range Consensus {

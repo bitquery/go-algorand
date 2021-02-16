@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -94,6 +94,7 @@ type Transaction struct {
 	AssetTransferTxnFields
 	AssetFreezeTxnFields
 	ApplicationCallTxnFields
+	CompactCertTxnFields
 }
 
 // ApplyData contains information about the transaction's execution.
@@ -102,6 +103,9 @@ type ApplyData struct {
 
 	// Closing amount for transaction.
 	ClosingAmount basics.MicroAlgos `codec:"ca"`
+
+	// Closing amount for asset transaction.
+	AssetClosingAmount uint64 `codec:"aca"`
 
 	// Rewards applied to the Sender, Receiver, and CloseRemainderTo accounts.
 	SenderRewards   basics.MicroAlgos `codec:"rs"`
@@ -114,6 +118,9 @@ type ApplyData struct {
 // EvalDelta's internal deltas (see EvalDelta.Equal for more information)
 func (ad ApplyData) Equal(o ApplyData) bool {
 	if ad.ClosingAmount != o.ClosingAmount {
+		return false
+	}
+	if ad.AssetClosingAmount != o.AssetClosingAmount {
 		return false
 	}
 	if ad.SenderRewards != o.SenderRewards {
@@ -155,7 +162,9 @@ func (tx Transaction) ToBeHashed() (protocol.HashID, []byte) {
 
 // ID returns the Txid (i.e., hash) of the transaction.
 func (tx Transaction) ID() Txid {
-	return Txid(crypto.HashObj(tx))
+	enc := tx.MarshalMsg(append(protocol.GetEncodingBuf(), []byte(protocol.Transaction)...))
+	defer protocol.PutEncodingBuf(enc)
+	return Txid(crypto.Hash(enc))
 }
 
 // Sign signs a transaction using a given Account's secrets.
@@ -349,6 +358,35 @@ func (tx Transaction) WellFormed(spec SpecialAddresses, proto config.ConsensusPa
 		if tx.GlobalStateSchema.NumEntries() > proto.MaxGlobalSchemaEntries {
 			return fmt.Errorf("tx.GlobalStateSchema too large, max number of keys is %d", proto.MaxGlobalSchemaEntries)
 		}
+
+	case protocol.CompactCertTx:
+		if proto.CompactCertRounds == 0 {
+			return fmt.Errorf("compact certs not supported")
+		}
+
+		// This is a placeholder transaction used to store compact certs
+		// on the ledger, and ensure they are broadly available.  Most of
+		// the fields must be empty.  It must be issued from a special
+		// sender address.
+		if tx.Sender != CompactCertSender {
+			return fmt.Errorf("sender must be the compact-cert sender")
+		}
+		if !tx.Fee.IsZero() {
+			return fmt.Errorf("fee must be zero")
+		}
+		if len(tx.Note) != 0 {
+			return fmt.Errorf("note must be empty")
+		}
+		if !tx.Group.IsZero() {
+			return fmt.Errorf("group must be zero")
+		}
+		if !tx.RekeyTo.IsZero() {
+			return fmt.Errorf("rekey must be zero")
+		}
+		if tx.Lease != [32]byte{} {
+			return fmt.Errorf("lease must be zero")
+		}
+
 	default:
 		return fmt.Errorf("unknown tx type %v", tx.Type)
 	}
@@ -378,6 +416,10 @@ func (tx Transaction) WellFormed(spec SpecialAddresses, proto config.ConsensusPa
 		nonZeroFields[protocol.ApplicationCallTx] = true
 	}
 
+	if !tx.CompactCertTxnFields.Empty() {
+		nonZeroFields[protocol.CompactCertTx] = true
+	}
+
 	for t, nonZero := range nonZeroFields {
 		if nonZero && t != tx.Type {
 			return fmt.Errorf("transaction of type %v has non-zero fields for type %v", tx.Type, t)
@@ -385,7 +427,11 @@ func (tx Transaction) WellFormed(spec SpecialAddresses, proto config.ConsensusPa
 	}
 
 	if tx.Fee.LessThan(basics.MicroAlgos{Raw: proto.MinTxnFee}) {
-		return makeMinFeeErrorf("transaction had fee %v, which is less than the minimum %v", tx.Fee, proto.MinTxnFee)
+		if tx.Type == protocol.CompactCertTx {
+			// Zero fee allowed for compact cert txn.
+		} else {
+			return makeMinFeeErrorf("transaction had fee %d, which is less than the minimum %d", tx.Fee.Raw, proto.MinTxnFee)
+		}
 	}
 	if tx.LastValid < tx.FirstValid {
 		return fmt.Errorf("transaction invalid range (%v--%v)", tx.FirstValid, tx.LastValid)

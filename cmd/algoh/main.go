@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -300,7 +300,7 @@ func initTelemetry(genesis bookkeeping.Genesis, log logging.Logger, dataDirector
 		fmt.Fprintf(os.Stdout, "algoh telemetry configured from '%s'\n", telemetryConfig.FilePath)
 
 		// Apply telemetry override.
-		telemetryConfig.Enable = logging.TelemetryOverride(*telemetryOverride)
+		telemetryConfig.Enable = logging.TelemetryOverride(*telemetryOverride, &telemetryConfig)
 
 		if telemetryConfig.Enable {
 			err = log.EnableTelemetry(telemetryConfig)

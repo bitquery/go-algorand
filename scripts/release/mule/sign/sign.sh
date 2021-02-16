@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# shellcheck disable=2035
+# shellcheck disable=2035,2129
+
+# TODO: This needs to be reworked a bit to support Darwin.
 
 set -exo pipefail
 
@@ -7,84 +9,105 @@ echo
 date "+build_release begin SIGN stage %Y%m%d_%H%M%S"
 echo
 
-PKG_TYPE="$1"
-ARCH_BIT=$(uname -m)
-ARCH_TYPE=$(./scripts/archtype.sh)
-OS_TYPE=$(./scripts/ostype.sh)
+if [ -z "$NETWORK" ]; then
+    echo "[$0] NETWORK is missing."
+    exit 1
+fi
+
+CHANNEL=$(./scripts/release/mule/common/get_channel.sh "$NETWORK")
 VERSION=${VERSION:-$(./scripts/compute_build_number.sh -f)}
-BRANCH=${BRANCH:-$(git rev-parse --abbrev-ref HEAD)}
-CHANNEL=${CHANNEL:-$(./scripts/compute_branch_channel.sh "$BRANCH")}
-PKG_DIR="./tmp/node_pkgs/$OS_TYPE/$ARCH_TYPE"
+PKG_DIR="./tmp/node_pkgs"
 SIGNING_KEY_ADDR=dev@algorand.com
+OS_TYPE=$(./scripts/release/mule/common/ostype.sh)
+ARCHS=(amd64 arm arm64)
+ARCH_BITS=(x86_64 armv7l aarch64)
+# Note that we don't want to use $GNUPGHOME here because that is a documented env var for the gnupg
+# project and if it's set in the environment mule will automatically pick it up, which could have
+# unintended consequences and be hard to debug.
+#
+# By naming it something other than $GNUPGHOME, it's essentially acting as an opt-in.
+GPG_DIR=${GPG_DIR:-/root/.gnupg}
 
-if ! $USE_CACHE
+if ./scripts/release/mule/common/running_in_docker.sh
 then
-    export ARCH_BIT
-    export ARCH_TYPE
-    export CHANNEL
-    export OS_TYPE
-    export VERSION
-
-    if [ "$PKG_TYPE" == "tar.gz" ]
-    then
-        mule -f package-sign.yaml package-sign-setup-tarball
-    else
-        mule -f package-sign.yaml "package-sign-setup-$PKG_TYPE"
-    fi
+    # It seems that copying/mounting the gpg dir from another machine can result in insecure
+    # access privileges, so set the correct permissions to avoid the following warning:
+    #
+    #   gpg: WARNING: unsafe permissions on homedir '/root/.gnupg'
+    #
+    find "$GPG_DIR" -type d -exec chmod 700 {} \;
+    find "$GPG_DIR" -type f -exec chmod 600 {} \;
 fi
 
-make_hashes () {
-    # We need to futz a bit with "source" to make the hashes correct.
-    local HASH_TYPE=${1:-$PKG_TYPE}
-    local PACKAGE_TYPE=${2:-$PKG_TYPE}
-
-    HASHFILE="hashes_${CHANNEL}_${OS_TYPE}_${ARCH_TYPE}_${VERSION}_${HASH_TYPE}"
-    # Remove any previously-generated hashes.
-    rm -f "$HASHFILE"*
-
-    {
-        md5sum *"$VERSION"*."$PACKAGE_TYPE" ;
-        shasum -a 256 *"$VERSION"*."$PACKAGE_TYPE" ;
-        shasum -a 512 *"$VERSION"*."$PACKAGE_TYPE" ;
-    } >> "$HASHFILE"
-
-    gpg -u "$SIGNING_KEY_ADDR" --detach-sign "$HASHFILE"
-    gpg -u "$SIGNING_KEY_ADDR" --clearsign "$HASHFILE"
-}
-
-make_sigs () {
-    local PACKAGE_TYPE=${1:-$PKG_TYPE}
-
-    # Remove any previously-generated signatures.
-    rm -f ./*"$VERSION"*."$PACKAGE_TYPE".sig
-
-    for item in *"$VERSION"*."$1"
-    do
-        gpg -u "$SIGNING_KEY_ADDR" --detach-sign "$item"
+# Note that when downloading from the cloud that we'll get all packages for all architectures.
+if [ -n "$S3_SOURCE" ]
+then
+    i=0
+    for arch in "${ARCHS[@]}"; do
+        arch_bit="${ARCH_BITS[$i]}"
+        (
+            mkdir -p "$PKG_DIR/$OS_TYPE/$arch"
+            cd "$PKG_DIR"
+            # Note the underscore after ${arch}!
+            # Recall that rpm packages have the arch bit in the filenames (i.e., "x86_64" rather than "amd64").
+            # Also, the order of the includes/excludes is important!
+            aws s3 cp --recursive --exclude "*" --include "*${arch}_*" --include "*$arch_bit.rpm" --exclude "*.sig" --exclude "*.asc" --exclude "*.asc.gz" "s3://$S3_SOURCE/$CHANNEL/$VERSION" .
+        )
+        i=$((i + 1))
     done
-}
-
-pushd "$PKG_DIR"
-
-GPG_HOME_DIR=$(gpgconf --list-dirs | grep homedir | awk -F: '{ print $2 }')
-chmod 400 "$GPG_HOME_DIR"
-
-if [ "$PKG_TYPE" == "source" ]
-then
-    git archive --prefix="algorand-$FULLVERSION/" "$BRANCH" | gzip >| "$PKG_DIR/algorand_${CHANNEL}_source_${VERSION}.tar.gz"
-    make_sigs tar.gz
-    make_hashes source tar.gz
-else
-    if [ "$PKG_TYPE" == "rpm" ]
-    then
-        SIGNING_KEY_ADDR=rpm@algorand.com
-    fi
-
-    make_sigs "$PKG_TYPE"
-    make_hashes
 fi
 
-popd
+cd "$PKG_DIR"
+
+# TODO: "$PKG_TYPE" == "source"
+
+# https://unix.stackexchange.com/a/46259
+# Grab the directories directly underneath (max-depth 1) ./tmp/node_pkgs/ into a space-delimited string.
+# This will help us target `linux`, `darwin` and (possibly) `windows` build assets.
+# Note the surrounding parens turns the string created by `find` into an array.
+OS_TYPES=($(find . -mindepth 1 -maxdepth 1 -type d -printf '%f\n'))
+for os in "${OS_TYPES[@]}"; do
+    if [ "$os" = linux ]
+    then
+        for arch in "${ARCHS[@]}"; do
+            if [ -d "$os/$arch" ]
+            then
+                # Only do the subsequent operations in a subshell if the directory is not empty.
+                if stat -t "$os/$arch/"* > /dev/null 2>&1
+                then
+                (
+                    cd "$os/$arch"
+
+                    # Clean package directory of any previous operations.
+                    rm -rf hashes* *.sig *.asc *.asc.gz
+
+                    for file in *.tar.gz *.deb
+                    do
+                        gpg -u "$SIGNING_KEY_ADDR" --detach-sign "$file"
+                    done
+
+                    for file in *.rpm
+                    do
+                        gpg -u rpm@algorand.com --detach-sign "$file"
+                    done
+
+                    HASHFILE="hashes_${CHANNEL}_${os}_${arch}_${VERSION}"
+                    md5sum *.tar.gz *.deb *.rpm >> "$HASHFILE"
+                    shasum -a 256 *.tar.gz *.deb *.rpm >> "$HASHFILE"
+                    shasum -a 512 *.tar.gz *.deb *.rpm >> "$HASHFILE"
+
+                    gpg -u "$SIGNING_KEY_ADDR" --detach-sign "$HASHFILE"
+                    gpg -u "$SIGNING_KEY_ADDR" --clearsign "$HASHFILE"
+
+                    STATUSFILE="build_status_${CHANNEL}_${os}-${arch}_${VERSION}"
+                    gpg -u "$SIGNING_KEY_ADDR" --clearsign "$STATUSFILE"
+                    gzip -c "$STATUSFILE.asc" > "$STATUSFILE.asc.gz"
+                )
+                fi
+            fi
+        done
+    fi
+done
 
 echo
 date "+build_release end SIGN stage %Y%m%d_%H%M%S"

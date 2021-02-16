@@ -227,6 +227,16 @@ type AssetParams struct {
 	Url *string `json:"url,omitempty"`
 }
 
+// BuildVersion defines model for BuildVersion.
+type BuildVersion struct {
+	Branch      string `json:"branch"`
+	BuildNumber uint64 `json:"build_number"`
+	Channel     string `json:"channel"`
+	CommitHash  string `json:"commit_hash"`
+	Major       uint64 `json:"major"`
+	Minor       uint64 `json:"minor"`
+}
+
 // DryrunRequest defines model for DryrunRequest.
 type DryrunRequest struct {
 	Accounts []Account     `json:"accounts"`
@@ -340,22 +350,10 @@ type TealValue struct {
 
 // Version defines model for Version.
 type Version struct {
-
-	// the current algod build version information.
-	Build       VersionBuild `json:"build"`
-	GenesisHash []byte       `json:"genesis-hash"`
-	GenesisId   string       `json:"genesis-id"`
-	Versions    []string     `json:"versions"`
-}
-
-// VersionBuild defines model for VersionBuild.
-type VersionBuild struct {
-	Branch      string `json:"branch"`
-	BuildNumber uint64 `json:"build-number"`
-	Channel     string `json:"channel"`
-	CommitHash  []byte `json:"commit-hash"`
-	Major       uint64 `json:"major"`
-	Minor       uint64 `json:"minor"`
+	Build          BuildVersion `json:"build"`
+	GenesisHashB64 []byte       `json:"genesis_hash_b64"`
+	GenesisId      string       `json:"genesis_id"`
+	Versions       []string     `json:"versions"`
 }
 
 // AccountId defines model for account-id.
@@ -485,7 +483,7 @@ type NodeStatusResponse struct {
 	// The number of blocks that have already been obtained by the node as part of the catchup
 	CatchpointAcquiredBlocks *uint64 `json:"catchpoint-acquired-blocks,omitempty"`
 
-	// The number of account from the current catchpoint that have been processed so far as part of the catchup
+	// The number of accounts from the current catchpoint that have been processed so far as part of the catchup
 	CatchpointProcessedAccounts *uint64 `json:"catchpoint-processed-accounts,omitempty"`
 
 	// The total number of accounts included in the current catchpoint
@@ -493,6 +491,9 @@ type NodeStatusResponse struct {
 
 	// The total number of blocks that are required to complete the current catchpoint catchup
 	CatchpointTotalBlocks *uint64 `json:"catchpoint-total-blocks,omitempty"`
+
+	// The number of accounts from the current catchpoint that have been verified so far as part of the catchup
+	CatchpointVerifiedAccounts *uint64 `json:"catchpoint-verified-accounts,omitempty"`
 
 	// CatchupTime in nanoseconds
 	CatchupTime uint64 `json:"catchup-time"`
@@ -527,6 +528,9 @@ type PendingTransactionResponse struct {
 
 	// The application index if the transaction was found and it created an application.
 	ApplicationIndex *uint64 `json:"application-index,omitempty"`
+
+	// The number of the asset's unit that were transferred to the close-to address.
+	AssetClosingAmount *uint64 `json:"asset-closing-amount,omitempty"`
 
 	// The asset index if the transaction was found and it created an asset.
 	AssetIndex *uint64 `json:"asset-index,omitempty"`
@@ -615,6 +619,9 @@ type TransactionParametersResponse struct {
 	// txn to validate for the current network protocol.
 	MinFee uint64 `json:"min-fee"`
 }
+
+// VersionsResponse defines model for VersionsResponse.
+type VersionsResponse Version
 
 // AccountInformationParams defines parameters for AccountInformation.
 type AccountInformationParams struct {

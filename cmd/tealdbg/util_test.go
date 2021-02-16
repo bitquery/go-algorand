@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -30,4 +30,5 @@ func TestVLQ(t *testing.T) {
 	a.Equal("AAEA", MakeSourceMapLine(0, 0, 2, 0))
 	a.Equal("AAgBA", MakeSourceMapLine(0, 0, 16, 0))
 	a.Equal("AAggBA", MakeSourceMapLine(0, 0, 512, 0))
+	a.Equal("ADggBD", MakeSourceMapLine(0, -1, 512, -1))
 }

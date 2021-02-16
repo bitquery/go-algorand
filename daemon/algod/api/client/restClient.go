@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -35,7 +35,7 @@ import (
 
 	"github.com/algorand/go-algorand/crypto"
 	"github.com/algorand/go-algorand/daemon/algod/api/spec/common"
-	"github.com/algorand/go-algorand/daemon/algod/api/spec/v1"
+	v1 "github.com/algorand/go-algorand/daemon/algod/api/spec/v1"
 	"github.com/algorand/go-algorand/data/basics"
 	"github.com/algorand/go-algorand/data/transactions"
 	"github.com/algorand/go-algorand/protocol"
@@ -64,6 +64,19 @@ var rawRequestPaths = map[string]bool{
 	"/v2/teal/compile": true,
 }
 
+// unauthorizedRequestError is generated when we receive 401 error from the server. This error includes the inner error
+// as well as the likely parameters that caused the issue.
+type unauthorizedRequestError struct {
+	errorString string
+	apiToken    string
+	url         string
+}
+
+// Error format an error string for the unauthorizedRequestError error.
+func (e unauthorizedRequestError) Error() string {
+	return fmt.Sprintf("Unauthorized request to `%s` when using token `%s` : %s", e.url, e.apiToken, e.errorString)
+}
+
 // RestClient manages the REST interface for a calling user.
 type RestClient struct {
 	serverURL       url.URL
@@ -87,16 +100,37 @@ func (client *RestClient) SetAPIVersionAffinity(affinity APIVersion) (previousAf
 	return
 }
 
-// extractError checks if the response signifies an error (for now, StatusCode != 200).
+// filterASCII filter out the non-ascii printable characters out of the given input string.
+// It's used as a security qualifier before adding network provided data into an error message.
+// The function allows only characters in the range of [32..126], which excludes all the
+// control character, new lines, deletion, etc. All the alpha numeric and punctuation characters
+// are included in this range.
+func filterASCII(unfilteredString string) (filteredString string) {
+	for i, r := range unfilteredString {
+		if int(r) >= 0x20 && int(r) <= 0x7e {
+			filteredString += string(unfilteredString[i])
+		}
+	}
+	return
+}
+
+// extractError checks if the response signifies an error (for now, StatusCode != 200 or StatusCode != 201).
 // If so, it returns the error.
 // Otherwise, it returns nil.
 func extractError(resp *http.Response) error {
-	if resp.StatusCode == 200 {
+	if resp.StatusCode == 200 || resp.StatusCode == 201 {
 		return nil
 	}
 
 	errorBuf, _ := ioutil.ReadAll(resp.Body) // ignore returned error
-	return fmt.Errorf("HTTP %v: %s", resp.Status, errorBuf)
+	errorString := filterASCII(string(errorBuf))
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		apiToken := resp.Request.Header.Get(authHeader)
+		return unauthorizedRequestError{errorString, apiToken, resp.Request.URL.String()}
+	}
+
+	return fmt.Errorf("HTTP %s: %s", resp.Status, errorString)
 }
 
 // stripTransaction gets a transaction of the form "tx-XXXXXXXX" and truncates the "tx-" part, if it starts with "tx-"
@@ -218,6 +252,21 @@ func (client RestClient) Status() (response generatedV2.NodeStatusResponse, err 
 	return
 }
 
+// WaitForBlock returns the node status after waiting for the given round.
+func (client RestClient) WaitForBlock(round basics.Round) (response generatedV2.NodeStatusResponse, err error) {
+	switch client.versionAffinity {
+	case APIVersionV2:
+		err = client.get(&response, fmt.Sprintf("/v2/status/wait-for-block-after/%d/", round), nil)
+	default:
+		var nodeStatus v1.NodeStatus
+		err = client.get(&nodeStatus, fmt.Sprintf("/v1/status/wait-for-block-after/%d/", round), nil)
+		if err == nil {
+			response = fillNodeStatusResponse(nodeStatus)
+		}
+	}
+	return
+}
+
 // HealthCheck does a health check on the the potentially running node,
 // returning an error if the API is down
 func (client RestClient) HealthCheck() error {
@@ -299,7 +348,7 @@ type rawblockParams struct {
 	Raw uint64 `url:"raw"`
 }
 
-type rawAccountParams struct {
+type rawFormat struct {
 	Format string `url:"format"`
 }
 
@@ -358,7 +407,7 @@ func (blob *Blob) SetBytes(b []byte) {
 // RawAccountInformationV2 gets the raw AccountData associated with the passed address
 func (client RestClient) RawAccountInformationV2(address string) (response []byte, err error) {
 	var blob Blob
-	err = client.getRaw(&blob, fmt.Sprintf("/v2/accounts/%s", address), rawAccountParams{Format: "msgpack"})
+	err = client.getRaw(&blob, fmt.Sprintf("/v2/accounts/%s", address), rawFormat{Format: "msgpack"})
 	response = blob
 	return
 }
@@ -423,8 +472,17 @@ func (client RestClient) Block(round uint64) (response v1.Block, err error) {
 }
 
 // RawBlock gets the encoded, raw msgpack block for the given round
-func (client RestClient) RawBlock(round uint64) (response v1.RawBlock, err error) {
-	err = client.getRaw(&response, fmt.Sprintf("/v1/block/%d", round), rawblockParams{1})
+func (client RestClient) RawBlock(round uint64) (response []byte, err error) {
+	switch client.versionAffinity {
+	case APIVersionV2:
+		var blob Blob
+		err = client.getRaw(&blob, fmt.Sprintf("/v2/blocks/%d", round), rawFormat{Format: "msgpack"})
+		response = blob
+	default:
+		var raw v1.RawBlock
+		err = client.getRaw(&raw, fmt.Sprintf("/v1/block/%d", round), rawblockParams{1})
+		response = raw
+	}
 	return
 }
 

@@ -34,16 +34,13 @@ SCRIPTPATH="$( cd "$(dirname "$0")" ; pwd -P )"
 
 OS=$("${SCRIPTPATH}/../ostype.sh")
 ARCH=$("${SCRIPTPATH}/../archtype.sh")
-# Use go version specified by get_golang_version.sh
-if ! GOLANG_VERSION=$("${SCRIPTPATH}/../get_golang_version.sh")
-then
-    echo "${GOLANG_VERSION}"
-    exit 1
-fi
+
+# Get the go build version.
+GOLANG_VERSION=$(./scripts/get_golang_version.sh)
 
 curl -sL -o ~/gimme https://raw.githubusercontent.com/travis-ci/gimme/master/gimme
 chmod +x ~/gimme
-eval $(~/gimme "${GOLANG_VERSION}")
+eval "$(~/gimme "${GOLANG_VERSION}")"
 
 # travis sometimes fail to download a dependency. trying multiple times might help.
 for (( attempt=1; attempt<=5; attempt++ ))
@@ -69,8 +66,9 @@ scripts/travis/before_build.sh
 # Force re-evaluation of genesis files to see if source files changed w/o running make
 touch gen/generate.go
 
-if [ "${OS}-${ARCH}" = "linux-arm" ]; then
+if [ "${OS}-${ARCH}" = "linux-arm" ] || [ "${OS}-${ARCH}" = "windows-amd64" ]; then
     # for arm, build just the basic distro
+    # for windows, we still have some issues with the enlistment checking, so we'll make it simple for now.
     MAKE_DEBUG_OPTION=""
 fi
 
@@ -81,19 +79,12 @@ if [ "${MAKE_DEBUG_OPTION}" != "" ]; then
     # we want to have that only on system where we have some debugging abilities. Platforms that do not support
     # debugging ( i.e. arm ) are also usually under powered and making this extra step
     # would be very costly there.
-    make msgp
+    if [ "${BUILD_TYPE}" = "integration" ]; then
+        echo "Skipping msgp regeneration on integration test"
+    else
+        make msgp
+    fi
     make build build-race
 else
     make build
-fi
-
-echo Checking Enlistment...
-
-if [[ -n $(git status --porcelain) ]]; then
-    echo Enlistment is dirty - did you forget to run make?
-    git status -s
-    git diff
-    exit 1
-else
-    echo Enlistment is clean
 fi

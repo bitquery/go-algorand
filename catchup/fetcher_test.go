@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -93,9 +93,6 @@ func (client *mockRPCClient) GetAddress() string {
 }
 func (client *mockRPCClient) GetHTTPClient() *http.Client {
 	return nil
-}
-func (client *mockRPCClient) PrepareURL(x string) string {
-	return strings.Replace(x, "{genesisID}", "test genesisID", -1)
 }
 
 type mockClientAggregator struct {
@@ -535,6 +532,10 @@ func (b *basicRPCNode) GetPeers(options ...network.PeerOption) []network.Peer {
 	return b.peers
 }
 
+func (b *basicRPCNode) SubstituteGenesisID(rawURL string) string {
+	return strings.Replace(rawURL, "{genesisID}", "test genesisID", -1)
+}
+
 type httpTestPeerSource struct {
 	peers []network.Peer
 	mocks.MockNetwork
@@ -549,14 +550,15 @@ func (s *httpTestPeerSource) RegisterHandlers(dispatch []network.TaggedMessageHa
 	s.dispatchHandlers = append(s.dispatchHandlers, dispatch...)
 }
 
+func (s *httpTestPeerSource) SubstituteGenesisID(rawURL string) string {
+	return strings.Replace(rawURL, "{genesisID}", "test genesisID", -1)
+}
+
 // implement network.HTTPPeer
 type testHTTPPeer string
 
 func (p *testHTTPPeer) GetAddress() string {
 	return string(*p)
-}
-func (p *testHTTPPeer) PrepareURL(x string) string {
-	return strings.Replace(x, "{genesisID}", "test genesisID", -1)
 }
 func (p *testHTTPPeer) GetHTTPClient() *http.Client {
 	return &http.Client{}
@@ -565,14 +567,6 @@ func (p *testHTTPPeer) GetHTTPPeer() network.HTTPPeer {
 	return p
 }
 
-func buildTestHTTPPeerSource(rootURLs ...string) *httpTestPeerSource {
-	peers := []network.Peer{}
-	for url := range rootURLs {
-		peer := testHTTPPeer(url)
-		peers = append(peers, &peer)
-	}
-	return &httpTestPeerSource{peers: peers}
-}
 func (s *httpTestPeerSource) addPeer(rootURL string) {
 	peer := testHTTPPeer(rootURL)
 	s.peers = append(s.peers, &peer)
@@ -588,7 +582,7 @@ func TestGetBlockHTTP(t *testing.T) {
 		t.Fatal(err)
 		return
 	}
-	net := buildTestHTTPPeerSource()
+	net := &httpTestPeerSource{}
 	ls := rpcs.MakeBlockService(config.GetDefaultLocal(), ledger, net, "test genesisID")
 
 	nodeA := basicRPCNode{}
@@ -876,7 +870,7 @@ func TestGetBlockWS(t *testing.T) {
 	versions := []string{"1", "2.1"}
 	for _, version := range versions { // range network.SupportedProtocolVersions {
 
-		net := buildTestHTTPPeerSource()
+		net := &httpTestPeerSource{}
 		blockServiceConfig := config.GetDefaultLocal()
 		blockServiceConfig.CatchupParallelBlocks = 5
 		blockServiceConfig.EnableBlockService = true

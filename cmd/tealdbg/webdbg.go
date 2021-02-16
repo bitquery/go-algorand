@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -19,8 +19,8 @@ package main
 //go:generate ./bundle_home_html.sh
 
 import (
-	"bytes"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"log"
 	"net/http"
@@ -31,8 +31,8 @@ import (
 	"github.com/gorilla/mux"
 )
 
-// WebPageAdapter is web page debugger
-type WebPageAdapter struct {
+// WebPageFrontend is web page debugging frontend
+type WebPageFrontend struct {
 	mu         deadlock.Mutex
 	sessions   map[string]wpaSession
 	apiAddress string
@@ -58,20 +58,15 @@ type ContinueRequest struct {
 	ExecID ExecID `json:"execid"`
 }
 
-// WebPageAdapterParams initialization parameters
-type WebPageAdapterParams struct {
+// WebPageFrontendParams initialization parameters
+type WebPageFrontendParams struct {
 	router     *mux.Router
 	apiAddress string
 }
 
-// MakeWebPageAdapter creates new WebPageAdapter
-func MakeWebPageAdapter(ctx interface{}) (a *WebPageAdapter) {
-	params, ok := ctx.(*WebPageAdapterParams)
-	if !ok {
-		panic("MakeWebPageAdapter expected CDTAdapterParams")
-	}
-
-	a = new(WebPageAdapter)
+// MakeWebPageFrontend creates new WebPageFrontend
+func MakeWebPageFrontend(params *WebPageFrontendParams) (a *WebPageFrontend) {
+	a = new(WebPageFrontend)
 	a.sessions = make(map[string]wpaSession)
 	a.apiAddress = params.apiAddress
 	a.done = make(chan struct{})
@@ -87,17 +82,17 @@ func MakeWebPageAdapter(ctx interface{}) (a *WebPageAdapter) {
 }
 
 // SessionStarted registers new session
-func (a *WebPageAdapter) SessionStarted(sid string, debugger Control, ch chan Notification) {
+func (a *WebPageFrontend) SessionStarted(sid string, debugger Control, ch chan Notification) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	a.sessions[sid] = wpaSession{debugger, ch}
 
-	log.Printf("Open %s in a web browser", a.apiAddress)
+	log.Printf("Open http://%s in a web browser", a.apiAddress)
 }
 
 // SessionEnded removes the session
-func (a *WebPageAdapter) SessionEnded(sid string) {
+func (a *WebPageFrontend) SessionEnded(sid string) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
@@ -105,11 +100,22 @@ func (a *WebPageAdapter) SessionEnded(sid string) {
 }
 
 // WaitForCompletion waits session to complete
-func (a *WebPageAdapter) WaitForCompletion() {
+func (a *WebPageFrontend) WaitForCompletion() {
 	<-a.done
 }
 
-func (a *WebPageAdapter) homeHandler(w http.ResponseWriter, r *http.Request) {
+// URL returns an URL to access the latest debugging session
+func (a *WebPageFrontend) URL() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.sessions) == 0 {
+		return ""
+	}
+
+	return fmt.Sprintf("http://%s/", a.apiAddress)
+}
+
+func (a *WebPageFrontend) homeHandler(w http.ResponseWriter, r *http.Request) {
 	home, err := template.New("home").Parse(homepage)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -121,7 +127,7 @@ func (a *WebPageAdapter) homeHandler(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-func (a *WebPageAdapter) stepHandler(w http.ResponseWriter, r *http.Request) {
+func (a *WebPageFrontend) stepHandler(w http.ResponseWriter, r *http.Request) {
 	// Decode a ConfigRequest
 	var req ConfigRequest
 	dec := json.NewDecoder(r.Body)
@@ -145,7 +151,7 @@ func (a *WebPageAdapter) stepHandler(w http.ResponseWriter, r *http.Request) {
 	return
 }
 
-func (a *WebPageAdapter) configHandler(w http.ResponseWriter, r *http.Request) {
+func (a *WebPageFrontend) configHandler(w http.ResponseWriter, r *http.Request) {
 	// Decode a ConfigRequest
 	var req ConfigRequest
 	dec := json.NewDecoder(r.Body)
@@ -165,18 +171,18 @@ func (a *WebPageAdapter) configHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Extract PC from config
-	breakLine := req.debugConfig.BreakAtLine
-	if breakLine == -1 {
-		s.debugger.RemoveBreakpoint(breakLine)
+	line := req.debugConfig.BreakAtLine
+	if line == noBreak {
+		s.debugger.RemoveBreakpoint(int(line))
 	} else {
-		s.debugger.SetBreakpoint(breakLine)
+		s.debugger.SetBreakpoint(int(line))
 	}
 
 	w.WriteHeader(http.StatusOK)
 	return
 }
 
-func (a *WebPageAdapter) continueHandler(w http.ResponseWriter, r *http.Request) {
+func (a *WebPageFrontend) continueHandler(w http.ResponseWriter, r *http.Request) {
 	// Decode a ContinueRequest
 	var req ContinueRequest
 	dec := json.NewDecoder(r.Body)
@@ -200,7 +206,7 @@ func (a *WebPageAdapter) continueHandler(w http.ResponseWriter, r *http.Request)
 	return
 }
 
-func (a *WebPageAdapter) subscribeHandler(w http.ResponseWriter, r *http.Request) {
+func (a *WebPageFrontend) subscribeHandler(w http.ResponseWriter, r *http.Request) {
 	defer func() {
 		close(a.done)
 	}()
@@ -216,7 +222,8 @@ func (a *WebPageAdapter) subscribeHandler(w http.ResponseWriter, r *http.Request
 	event := Notification{
 		Event: "connected",
 	}
-	err = ws.WriteJSON(&event)
+	enc := protocol.EncodeJSONStrict(&event)
+	err = ws.WriteMessage(websocket.TextMessage, enc)
 	if err != nil {
 		return
 	}
@@ -235,13 +242,8 @@ func (a *WebPageAdapter) subscribeHandler(w http.ResponseWriter, r *http.Request
 	for {
 		select {
 		case notification := <-notifications:
-			var data bytes.Buffer
-			enc := protocol.NewJSONEncoder(&data)
-			err := enc.Encode(notification)
-			if err != nil {
-				return
-			}
-			err = ws.WriteMessage(websocket.TextMessage, data.Bytes())
+			enc := protocol.EncodeJSONStrict(&notification)
+			err = ws.WriteMessage(websocket.TextMessage, enc)
 			if err != nil {
 				return
 			}

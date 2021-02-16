@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -28,7 +28,7 @@ func pingHandler(message IncomingMessage) OutgoingMessage {
 	if len(message.Data) > 8 {
 		return OutgoingMessage{}
 	}
-	message.Net.(*WebsocketNetwork).log.Debugf("ping from %#v", message.Sender)
+	message.Net.(*WebsocketNetwork).log.Debugf("ping from peer %#v", message.Sender.(*wsPeer).wsPeerCore)
 	peer := message.Sender.(*wsPeer)
 	tbytes := []byte(protocol.PingReplyTag)
 	mbytes := make([]byte, len(tbytes)+len(message.Data))
@@ -64,6 +64,6 @@ func pingReplyHandler(message IncomingMessage) OutgoingMessage {
 }
 
 var pingHandlers = []TaggedMessageHandler{
-	TaggedMessageHandler{protocol.PingTag, HandlerFunc(pingHandler)},
-	TaggedMessageHandler{protocol.PingReplyTag, HandlerFunc(pingReplyHandler)},
+	{protocol.PingTag, HandlerFunc(pingHandler)},
+	{protocol.PingReplyTag, HandlerFunc(pingReplyHandler)},
 }

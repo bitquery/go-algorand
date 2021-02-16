@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -31,10 +31,6 @@ const transactionFee = uint64(0)
 
 func TestAccountsCanChangeOnlineState(t *testing.T) {
 	testAccountsCanChangeOnlineState(t, filepath.Join("nettemplates", "TwoNodesPartlyOffline.json"))
-}
-
-func TestAccountsCanChangeOnlineStateV7(t *testing.T) {
-	testAccountsCanChangeOnlineState(t, filepath.Join("nettemplates", "TwoNodesPartlyOfflineV7.json"))
 }
 
 func TestAccountsCanChangeOnlineStateInTheFuture(t *testing.T) {

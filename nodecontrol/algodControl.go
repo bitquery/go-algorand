@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -39,6 +39,24 @@ const StdErrFilename = "algod-err.log"
 
 // StdOutFilename is the name of the file in <datadir> where stdout will be captured if not redirected to host
 const StdOutFilename = "algod-out.log"
+
+// NodeNotRunningError thrown when StopAlgod is called but there is no running algod in requested directory
+type NodeNotRunningError struct {
+	algodDataDir string
+}
+
+func (e *NodeNotRunningError) Error() string {
+	return fmt.Sprintf("no running node in directory '%s'", e.algodDataDir)
+}
+
+// MissingDataDirError thrown when StopAlgod is called but requested directory does not exist
+type MissingDataDirError struct {
+	algodDataDir string
+}
+
+func (e *MissingDataDirError) Error() string {
+	return fmt.Sprintf("the provided directory '%s' does not exist", e.algodDataDir)
+}
 
 // AlgodClient attempts to build a client.RestClient for communication with
 // the algod REST API, but fails if we can't find the net file
@@ -133,7 +151,11 @@ func (nc NodeController) algodRunning() (isRunning bool) {
 }
 
 // StopAlgod reads the net file and kills the algod process
-func (nc *NodeController) StopAlgod() (alreadyStopped bool, err error) {
+func (nc *NodeController) StopAlgod() (err error) {
+	// Check for valid data directory
+	if !util.IsDir(nc.algodDataDir) {
+		return &MissingDataDirError{algodDataDir: nc.algodDataDir}
+	}
 	// Find algod PID
 	algodPID, err := nc.GetAlgodPID()
 	if err == nil {
@@ -143,8 +165,7 @@ func (nc *NodeController) StopAlgod() (alreadyStopped bool, err error) {
 			return
 		}
 	} else {
-		err = nil
-		alreadyStopped = true
+		return &NodeNotRunningError{algodDataDir: nc.algodDataDir}
 	}
 	return
 }
@@ -170,7 +191,12 @@ func (nc *NodeController) StartAlgod(args AlgodStartArgs) (alreadyRunning bool, 
 		files := nc.setAlgodCmdLogFiles(algodCmd)
 		// Descriptors will get dup'd after exec, so OK to close when we return
 		for _, file := range files {
-			defer file.Close()
+			defer func(file *os.File) {
+				localError := file.Close()
+				if localError != nil && err == nil {
+					err = localError
+				}
+			}(file)
 		}
 	}
 
@@ -185,9 +211,8 @@ func (nc *NodeController) StartAlgod(args AlgodStartArgs) (alreadyRunning bool, 
 		errLogger.SetLinePrefix(linePrefix)
 		outLogger.SetLinePrefix(linePrefix)
 	}
-
 	// Wait on the algod process and check if exits
-	algodExitChan := make(chan struct{})
+	algodExitChan := make(chan error, 1)
 	startAlgodCompletedChan := make(chan struct{})
 	defer close(startAlgodCompletedChan)
 	go func() {
@@ -202,14 +227,14 @@ func (nc *NodeController) StartAlgod(args AlgodStartArgs) (alreadyRunning bool, 
 			}
 		default:
 		}
-		algodExitChan <- struct{}{}
+		algodExitChan <- err
 	}()
-
 	success := false
 	for !success {
 		select {
-		case <-algodExitChan:
-			return false, errAlgodExitedEarly
+		case err := <-algodExitChan:
+			err = &errAlgodExitedEarly{err}
+			return false, err
 		case <-time.After(time.Millisecond * 100):
 			// If we can't talk to the API yet, spin
 			algodClient, err := nc.AlgodClient()
@@ -263,10 +288,20 @@ func (nc NodeController) GetAlgodPath() string {
 
 // Clone creates a new DataDir based on the controller's DataDir; if copyLedger is true, we'll clone the ledger.sqlite file
 func (nc NodeController) Clone(targetDir string, copyLedger bool) (err error) {
-	os.RemoveAll(targetDir)
-	err = os.Mkdir(targetDir, 0700)
-	if err != nil && !os.IsExist(err) {
+	err = os.RemoveAll(targetDir)
+	if err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("unable to delete directory '%s' : %v", targetDir, err)
+	}
+
+	var sourceFolderStat os.FileInfo
+	sourceFolderStat, err = os.Stat(nc.algodDataDir)
+	if err != nil {
 		return
+	}
+
+	mkDirErr := os.Mkdir(targetDir, sourceFolderStat.Mode())
+	if mkDirErr != nil && !os.IsExist(mkDirErr) {
+		return mkDirErr
 	}
 
 	// Copy Core Files, silently failing to copy any that don't exist
@@ -296,19 +331,25 @@ func (nc NodeController) Clone(targetDir string, copyLedger bool) (err error) {
 		}
 
 		genesisFolder := filepath.Join(nc.algodDataDir, genesis.ID())
-		targetGenesisFolder := filepath.Join(targetDir, genesis.ID())
-		err = os.Mkdir(targetGenesisFolder, 0770)
+		var genesisFolderStat os.FileInfo
+		genesisFolderStat, err = os.Stat(genesisFolder)
 		if err != nil {
 			return
 		}
 
-		files := []string{"ledger.sqlite"}
+		targetGenesisFolder := filepath.Join(targetDir, genesis.ID())
+		mkDirErr = os.Mkdir(targetGenesisFolder, genesisFolderStat.Mode())
+		if mkDirErr != nil && !os.IsExist(mkDirErr) {
+			return mkDirErr
+		}
+
+		files := []string{"ledger.block.sqlite", "ledger.block.sqlite-shm", "ledger.block.sqlite-wal", "ledger.tracker.sqlite", "ledger.tracker.sqlite-shm", "ledger.tracker.sqlite-wal"}
 		for _, file := range files {
 			src := filepath.Join(genesisFolder, file)
 			dest := filepath.Join(targetGenesisFolder, file)
 			_, err = util.CopyFile(src, dest)
 			if err != nil {
-				return
+				return fmt.Errorf("unable to copy '%s' to '%s' : %v", src, dest, err)
 			}
 		}
 	}

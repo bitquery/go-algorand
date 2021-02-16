@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -138,7 +138,7 @@ func (am *Tracker) ProcessMessage(txn v1.Transaction) error {
 		case NoteDeposit:
 			auctionID := msg.SignedDeposit.Deposit.AuctionID
 			if _, ok := am.Auctions[auctionID]; !ok {
-				log.Warn("Invalid auction ID %v, dropping deposit message", auctionID)
+				log.Warnf("Invalid auction ID %v, dropping deposit message", auctionID)
 				continue
 			}
 

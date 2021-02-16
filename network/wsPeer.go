@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -21,11 +21,9 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"runtime"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -41,6 +39,7 @@ import (
 )
 
 const maxMessageLength = 4 * 1024 * 1024 // Currently the biggest message is VB vote bundles. TODO: per message type size limit?
+const averageMessageLength = 2 * 1024    // Most of the messages are smaller than this size, which makes it into a good base allocation.
 
 // This parameter controls how many messages from a single peer can be
 // queued up in the global wsNetwork.readBuffer at a time.  Making this
@@ -107,6 +106,7 @@ type wsPeerCore struct {
 
 type disconnectReason string
 
+const disconnectReasonNone disconnectReason = ""
 const disconnectBadData disconnectReason = "BadData"
 const disconnectTooSlow disconnectReason = "TooSlow"
 const disconnectReadError disconnectReason = "ReadError"
@@ -115,6 +115,8 @@ const disconnectIdleConn disconnectReason = "IdleConnection"
 const disconnectSlowConn disconnectReason = "SlowConnection"
 const disconnectLeastPerformingPeer disconnectReason = "LeastPerformingPeer"
 const disconnectCliqueResolve disconnectReason = "CliqueResolving"
+const disconnectRequestReceived disconnectReason = "DisconnectRequest"
+const disconnectStaleWrite disconnectReason = "DisconnectStaleWrite"
 
 // Response is the structure holding the response from the server
 type Response struct {
@@ -211,10 +213,6 @@ type wsPeer struct {
 type HTTPPeer interface {
 	GetAddress() string
 	GetHTTPClient() *http.Client
-
-	// PrepareURL takes a URL that may have substitution parameters in it and returns a URL with those parameters filled in.
-	// E.g. /v1/{genesisID}/gossip -> /v1/1234/gossip
-	PrepareURL(string) string
 }
 
 // UnicastPeer is another possible interface for the opaque Peer.
@@ -249,11 +247,6 @@ func (wp *wsPeerCore) GetAddress() string {
 // http.Client will maintain a cache of connections with some keepalive.
 func (wp *wsPeerCore) GetHTTPClient() *http.Client {
 	return &wp.client
-}
-
-// PrepareURL substitutes placeholders like "{genesisID}" for their values.
-func (wp *wsPeerCore) PrepareURL(rawURL string) string {
-	return strings.Replace(rawURL, "{genesisID}", wp.net.GenesisID, -1)
 }
 
 // Version returns the matching version from network.SupportedProtocolVersions
@@ -361,9 +354,13 @@ func dedupSafeTag(t protocol.Tag) bool {
 }
 
 func (wp *wsPeer) readLoop() {
-	defer wp.readLoopCleanup()
+	// the cleanupCloseError sets the default error to disconnectReadError; depending on the exit reason, the error might get changed.
+	cleanupCloseError := disconnectReadError
+	defer func() {
+		wp.readLoopCleanup(cleanupCloseError)
+	}()
 	wp.conn.SetReadLimit(maxMessageLength)
-	slurper := LimitedReaderSlurper{Limit: maxMessageLength}
+	slurper := MakeLimitedReaderSlurper(averageMessageLength, maxMessageLength)
 	for {
 		msg := IncomingMessage{}
 		mtype, reader, err := wp.conn.NextReader()
@@ -372,6 +369,7 @@ func (wp *wsPeer) readLoop() {
 				switch ce.Code {
 				case websocket.CloseNormalClosure, websocket.CloseGoingAway:
 					// deliberate close, no error
+					cleanupCloseError = disconnectRequestReceived
 					return
 				default:
 					// fall through to reportReadErr
@@ -515,8 +513,8 @@ func (wp *wsPeer) handleMessageOfInterest(msg IncomingMessage) (shutdown bool) {
 	return
 }
 
-func (wp *wsPeer) readLoopCleanup() {
-	wp.internalClose(disconnectReadError)
+func (wp *wsPeer) readLoopCleanup(reason disconnectReason) {
+	wp.internalClose(reason)
 	wp.wg.Done()
 }
 
@@ -535,23 +533,23 @@ func (wp *wsPeer) handleFilterMessage(msg IncomingMessage) {
 	wp.outgoingMsgFilter.CheckDigest(digest, true, true)
 }
 
-func (wp *wsPeer) writeLoopSend(msg sendMessage) (exit bool) {
+func (wp *wsPeer) writeLoopSend(msg sendMessage) disconnectReason {
 	if len(msg.data) > maxMessageLength {
-		wp.net.log.Errorf("trying to send a message longer than we would recieve: %d > %d tag=%#v", len(msg.data), maxMessageLength, string(msg.data[0:2]))
+		wp.net.log.Errorf("trying to send a message longer than we would recieve: %d > %d tag=%s", len(msg.data), maxMessageLength, string(msg.data[0:2]))
 		// just drop it, don't break the connection
-		return false
+		return disconnectReasonNone
 	}
 	if msg.msgTags != nil {
 		// when msg.msgTags is non-nil, the read loop has received a message-of-interest message that we want to apply.
 		// in order to avoid any locking, it sent it to this queue so that we could set it as the new outgoing message tag filter.
 		wp.sendMessageTag = msg.msgTags
-		return false
+		return disconnectReasonNone
 	}
 	// the tags are always 2 char long; note that this is safe since it's only being used for messages that we have generated locally.
 	tag := protocol.Tag(msg.data[:2])
 	if !wp.sendMessageTag[tag] {
 		// the peer isn't interested in this message.
-		return false
+		return disconnectReasonNone
 	}
 
 	// check if this message was waiting in the queue for too long. If this is the case, return "true" to indicate that we want to close the connection.
@@ -559,7 +557,7 @@ func (wp *wsPeer) writeLoopSend(msg sendMessage) (exit bool) {
 	if msgWaitDuration > maxMessageQueueDuration {
 		wp.net.log.Warnf("peer stale enqueued message %dms", msgWaitDuration.Nanoseconds()/1000000)
 		networkConnectionsDroppedTotal.Inc(map[string]string{"reason": "stale message"})
-		return true
+		return disconnectStaleWrite
 	}
 	atomic.StoreInt64(&wp.intermittentOutgoingMessageEnqueueTime, msg.enqueued.UnixNano())
 	defer atomic.StoreInt64(&wp.intermittentOutgoingMessageEnqueueTime, 0)
@@ -569,22 +567,27 @@ func (wp *wsPeer) writeLoopSend(msg sendMessage) (exit bool) {
 			wp.net.log.Warn("peer write error ", err)
 			networkConnectionsDroppedTotal.Inc(map[string]string{"reason": "write err"})
 		}
-		return true
+		return disconnectWriteError
 	}
 	atomic.StoreInt64(&wp.lastPacketTime, time.Now().UnixNano())
 	networkSentBytesTotal.AddUint64(uint64(len(msg.data)), nil)
 	networkMessageSentTotal.AddUint64(1, nil)
 	networkMessageQueueMicrosTotal.AddUint64(uint64(time.Now().Sub(msg.peerEnqueued).Nanoseconds()/1000), nil)
-	return false
+	return disconnectReasonNone
 }
 
 func (wp *wsPeer) writeLoop() {
-	defer wp.writeLoopCleanup()
+	// the cleanupCloseError sets the default error to disconnectWriteError; depending on the exit reason, the error might get changed.
+	cleanupCloseError := disconnectWriteError
+	defer func() {
+		wp.writeLoopCleanup(cleanupCloseError)
+	}()
 	for {
 		// send from high prio channel as long as we can
 		select {
 		case data := <-wp.sendBufferHighPrio:
-			if wp.writeLoopSend(data) {
+			if writeErr := wp.writeLoopSend(data); writeErr != disconnectReasonNone {
+				cleanupCloseError = writeErr
 				return
 			}
 			continue
@@ -595,18 +598,20 @@ func (wp *wsPeer) writeLoop() {
 		case <-wp.closing:
 			return
 		case data := <-wp.sendBufferHighPrio:
-			if wp.writeLoopSend(data) {
+			if writeErr := wp.writeLoopSend(data); writeErr != disconnectReasonNone {
+				cleanupCloseError = writeErr
 				return
 			}
 		case data := <-wp.sendBufferBulk:
-			if wp.writeLoopSend(data) {
+			if writeErr := wp.writeLoopSend(data); writeErr != disconnectReasonNone {
+				cleanupCloseError = writeErr
 				return
 			}
 		}
 	}
 }
-func (wp *wsPeer) writeLoopCleanup() {
-	wp.internalClose(disconnectWriteError)
+func (wp *wsPeer) writeLoopCleanup(reason disconnectReason) {
+	wp.internalClose(reason)
 	wp.wg.Done()
 }
 
@@ -650,7 +655,7 @@ func (wp *wsPeer) sendPing() bool {
 	tagBytes := []byte(protocol.PingTag)
 	mbytes := make([]byte, len(tagBytes)+pingLength)
 	copy(mbytes, tagBytes)
-	rand.Read(mbytes[len(tagBytes):])
+	crypto.RandBytes(mbytes[len(tagBytes):])
 	wp.pingData = mbytes[len(tagBytes):]
 	sent := wp.writeNonBlock(mbytes, false, crypto.Digest{}, time.Now())
 
@@ -683,8 +688,14 @@ func (wp *wsPeer) Close() {
 	atomic.StoreInt32(&wp.didSignalClose, 1)
 	if atomic.CompareAndSwapInt32(&wp.didInnerClose, 0, 1) {
 		close(wp.closing)
-		wp.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(5*time.Second))
-		wp.conn.CloseWithoutFlush()
+		err := wp.conn.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""), time.Now().Add(5*time.Second))
+		if err != nil {
+			wp.net.log.Infof("failed to write CloseMessage to connection for %s", wp.conn.RemoteAddr().String())
+		}
+		err = wp.conn.CloseWithoutFlush()
+		if err != nil {
+			wp.net.log.Infof("failed to CloseWithoutFlush to connection for %s", wp.conn.RemoteAddr().String())
+		}
 	}
 }
 

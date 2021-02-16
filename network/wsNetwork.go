@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"math"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/textproto"
@@ -38,13 +37,11 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	//"os"
 
 	"github.com/algorand/go-deadlock"
 	"github.com/algorand/websocket"
 	"github.com/gorilla/mux"
 	"golang.org/x/net/netutil"
-	"golang.org/x/sys/unix"
 
 	"github.com/algorand/go-algorand/config"
 	"github.com/algorand/go-algorand/crypto"
@@ -105,6 +102,10 @@ const maxMessageQueueDuration = 25 * time.Second
 // verify that their current outgoing message is not being blocked for too long.
 const slowWritingPeerMonitorInterval = 5 * time.Second
 
+// unprintableCharacterGlyph is used to replace any non-ascii character when logging incoming network string directly
+// to the log file. Note that the log file itself would also json-encode these before placing them in the log file.
+const unprintableCharacterGlyph = "▯"
+
 var networkIncomingConnections = metrics.MakeGauge(metrics.NetworkIncomingConnections)
 var networkOutgoingConnections = metrics.MakeGauge(metrics.NetworkOutgoingConnections)
 
@@ -141,8 +142,10 @@ const (
 	PeersConnectedOut PeerOption = iota
 	// PeersConnectedIn specifies all peers with inbound connections
 	PeersConnectedIn PeerOption = iota
-	// PeersPhonebook specifies all peers in the phonebook
-	PeersPhonebook PeerOption = iota
+	// PeersPhonebookRelays specifies all relays in the phonebook
+	PeersPhonebookRelays PeerOption = iota
+	// PeersPhonebookArchivers specifies all archivers in the phonebook
+	PeersPhonebookArchivers PeerOption = iota
 )
 
 // GossipNode represents a node in the gossip network
@@ -196,6 +199,9 @@ type GossipNode interface {
 	// newly connecting peers.  This should be called before the network
 	// is started.
 	RegisterMessageInterest(protocol.Tag) error
+
+	// SubstituteGenesisID substitutes the "{genesisID}" with their network-specific genesisID.
+	SubstituteGenesisID(rawURL string) string
 }
 
 // IncomingMessage represents a message arriving from some peer in our p2p network
@@ -556,10 +562,18 @@ func (wn *WebsocketNetwork) GetPeers(options ...PeerOption) []Peer {
 				}
 			}
 			wn.peersLock.RUnlock()
-		case PeersPhonebook:
+		case PeersPhonebookRelays:
 			// return copy of phonebook, which probably also contains peers we're connected to, but if it doesn't maybe we shouldn't be making new connections to those peers (because they disappeared from the directory)
 			var addrs []string
-			addrs = wn.phonebook.GetAddresses(1000)
+			addrs = wn.phonebook.GetAddresses(1000, PhoneBookEntryRelayRole)
+			for _, addr := range addrs {
+				peerCore := makePeerCore(wn, addr, wn.GetRoundTripper(), "" /*origin address*/)
+				outPeers = append(outPeers, &peerCore)
+			}
+		case PeersPhonebookArchivers:
+			// return copy of phonebook, which probably also contains peers we're connected to, but if it doesn't maybe we shouldn't be making new connections to those peers (because they disappeared from the directory)
+			var addrs []string
+			addrs = wn.phonebook.GetAddresses(1000, PhoneBookEntryArchiverRole)
 			for _, addr := range addrs {
 				peerCore := makePeerCore(wn, addr, wn.GetRoundTripper(), "" /*origin address*/)
 				outPeers = append(outPeers, &peerCore)
@@ -578,12 +592,13 @@ func (wn *WebsocketNetwork) GetPeers(options ...PeerOption) []Peer {
 }
 
 func (wn *WebsocketNetwork) setup() {
-	var preferredResolver *dnssec.Resolver
+	var preferredResolver dnssec.ResolverIf
 	if wn.config.DNSSecurityRelayAddrEnforced() {
-		preferredResolver = &dnssec.DefaultResolver
+		preferredResolver = dnssec.MakeDefaultDnssecResolver(wn.config.FallbackDNSResolverAddress, wn.log)
 	}
+	maxIdleConnsPerHost := int(wn.config.ConnectionsRateLimitingCount)
 	wn.dialer = makeRateLimitingDialer(wn.phonebook, preferredResolver)
-	wn.transport = makeRateLimitingTransport(wn.phonebook, 10*time.Second, &wn.dialer)
+	wn.transport = makeRateLimitingTransport(wn.phonebook, 10*time.Second, &wn.dialer, maxIdleConnsPerHost)
 
 	wn.upgrader.ReadBufferSize = 4096
 	wn.upgrader.WriteBufferSize = 4096
@@ -634,7 +649,7 @@ func (wn *WebsocketNetwork) setup() {
 	wn.readBuffer = make(chan IncomingMessage, readBufferLen)
 
 	var rbytes [10]byte
-	rand.Read(rbytes[:])
+	crypto.RandBytes(rbytes[:])
 	wn.RandomID = base64.StdEncoding.EncodeToString(rbytes[:])
 
 	if wn.config.EnableIncomingMessageFilter {
@@ -647,49 +662,10 @@ func (wn *WebsocketNetwork) setup() {
 	if wn.config.NetworkProtocolVersion != "" {
 		SupportedProtocolVersions = []string{wn.config.NetworkProtocolVersion}
 	}
-}
 
-func (wn *WebsocketNetwork) rlimitIncomingConnections() error {
-	var lim unix.Rlimit
-	err := unix.Getrlimit(unix.RLIMIT_NOFILE, &lim)
-	if err != nil {
-		return err
+	if wn.relayMessages {
+		wn.RegisterMessageInterest(protocol.CompactCertSigTag)
 	}
-
-	// If rlim_max is not sufficient, reduce IncomingConnectionsLimit
-	var rlimitMaxCap uint64
-	if lim.Max < wn.config.ReservedFDs {
-		rlimitMaxCap = 0
-	} else {
-		rlimitMaxCap = lim.Max - wn.config.ReservedFDs
-	}
-	if rlimitMaxCap > uint64(MaxInt) {
-		rlimitMaxCap = uint64(MaxInt)
-	}
-	if wn.config.IncomingConnectionsLimit > int(rlimitMaxCap) {
-		wn.log.Warnf("Reducing IncomingConnectionsLimit from %d to %d since RLIMIT_NOFILE is %d",
-			wn.config.IncomingConnectionsLimit, rlimitMaxCap, lim.Max)
-		wn.config.IncomingConnectionsLimit = int(rlimitMaxCap)
-	}
-
-	// Set rlim_cur to match IncomingConnectionsLimit
-	newLimit := uint64(wn.config.IncomingConnectionsLimit) + wn.config.ReservedFDs
-	if newLimit > lim.Cur {
-		if runtime.GOOS == "darwin" && newLimit > 10240 && lim.Max == 0x7fffffffffffffff {
-			// The max file limit is 10240, even though
-			// the max returned by Getrlimit is 1<<63-1.
-			// This is OPEN_MAX in sys/syslimits.h.
-			// see https://github.com/golang/go/issues/30401
-			newLimit = 10240
-		}
-		lim.Cur = newLimit
-		err = unix.Setrlimit(unix.RLIMIT_NOFILE, &lim)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
 }
 
 // Start makes network connections and threads
@@ -764,8 +740,10 @@ func (wn *WebsocketNetwork) Start() {
 		wn.wg.Add(1)
 		go wn.broadcastThread()
 	}
-	wn.wg.Add(1)
-	go wn.prioWeightRefresh()
+	if wn.prioScheme != nil {
+		wn.wg.Add(1)
+		go wn.prioWeightRefresh()
+	}
 	wn.log.Infof("serving genesisID=%s on %#v with RandomID=%s", wn.GenesisID, wn.PublicAddress(), wn.RandomID)
 }
 
@@ -847,7 +825,7 @@ func (wn *WebsocketNetwork) setHeaders(header http.Header) {
 func (wn *WebsocketNetwork) checkServerResponseVariables(otherHeader http.Header, addr string) (bool, string) {
 	matchingVersion, otherVersion := wn.checkProtocolVersionMatch(otherHeader)
 	if matchingVersion == "" {
-		wn.log.Infof("new peer %s version mismatch, mine=%v theirs=%s, headers %#v", addr, SupportedProtocolVersions, otherVersion, otherHeader)
+		wn.log.Info(filterASCII(fmt.Sprintf("new peer %s version mismatch, mine=%v theirs=%s, headers %#v", addr, SupportedProtocolVersions, otherVersion, otherHeader)))
 		return false, ""
 	}
 	otherRandom := otherHeader.Get(NodeRandomHeader)
@@ -855,7 +833,7 @@ func (wn *WebsocketNetwork) checkServerResponseVariables(otherHeader http.Header
 		// This is pretty harmless and some configurations of phonebooks or DNS records make this likely. Quietly filter it out.
 		if otherRandom == "" {
 			// missing header.
-			wn.log.Warnf("new peer %s did not include random ID header in request. mine=%s headers %#v", addr, wn.RandomID, otherHeader)
+			wn.log.Warn(filterASCII(fmt.Sprintf("new peer %s did not include random ID header in request. mine=%s headers %#v", addr, wn.RandomID, otherHeader)))
 		} else {
 			wn.log.Debugf("new peer %s has same node random id, am I talking to myself? %s", addr, wn.RandomID)
 		}
@@ -864,7 +842,7 @@ func (wn *WebsocketNetwork) checkServerResponseVariables(otherHeader http.Header
 	otherGenesisID := otherHeader.Get(GenesisHeader)
 	if wn.GenesisID != otherGenesisID {
 		if otherGenesisID != "" {
-			wn.log.Warnf("new peer %#v genesis mismatch, mine=%#v theirs=%#v, headers %#v", addr, wn.GenesisID, otherGenesisID, otherHeader)
+			wn.log.Warn(filterASCII(fmt.Sprintf("new peer %#v genesis mismatch, mine=%#v theirs=%#v, headers %#v", addr, wn.GenesisID, otherGenesisID, otherHeader)))
 		} else {
 			wn.log.Warnf("new peer %#v did not include genesis header in response. mine=%#v headers %#v", addr, wn.GenesisID, otherHeader)
 		}
@@ -934,7 +912,8 @@ func (wn *WebsocketNetwork) checkProtocolVersionMatch(otherHeaders http.Header) 
 			return supportedProtocolVersion, otherVersion
 		}
 	}
-	return "", otherVersion
+
+	return "", filterASCII(otherVersion)
 }
 
 // checkIncomingConnectionVariables checks the variables that were provided on the request, and compares them to the
@@ -951,10 +930,13 @@ func (wn *WebsocketNetwork) checkIncomingConnectionVariables(response http.Respo
 	}
 
 	if wn.GenesisID != otherGenesisID {
-		wn.log.Warnf("new peer %#v genesis mismatch, mine=%#v theirs=%#v, headers %#v", request.RemoteAddr, wn.GenesisID, otherGenesisID, request.Header)
+		wn.log.Warn(filterASCII(fmt.Sprintf("new peer %#v genesis mismatch, mine=%#v theirs=%#v, headers %#v", request.RemoteAddr, wn.GenesisID, otherGenesisID, request.Header)))
 		networkConnectionsDroppedTotal.Inc(map[string]string{"reason": "mismatching genesis-id"})
 		response.WriteHeader(http.StatusPreconditionFailed)
-		response.Write([]byte("mismatching genesis ID"))
+		n, err := response.Write([]byte("mismatching genesis ID"))
+		if err != nil {
+			wn.log.Warnf("ws failed to write mismatching genesis ID response '%s' : n = %d err = %v", n, err)
+		}
 		return http.StatusPreconditionFailed
 	}
 
@@ -963,7 +945,7 @@ func (wn *WebsocketNetwork) checkIncomingConnectionVariables(response http.Respo
 		// This is pretty harmless and some configurations of phonebooks or DNS records make this likely. Quietly filter it out.
 		var message string
 		// missing header.
-		wn.log.Warnf("new peer %s did not include random ID header in request. mine=%s headers %#v", request.RemoteAddr, wn.RandomID, request.Header)
+		wn.log.Warn(filterASCII(fmt.Sprintf("new peer %s did not include random ID header in request. mine=%s headers %#v", request.RemoteAddr, wn.RandomID, request.Header)))
 		networkConnectionsDroppedTotal.Inc(map[string]string{"reason": "missing random ID header"})
 		message = fmt.Sprintf("Request was missing a %s header", NodeRandomHeader)
 		response.WriteHeader(http.StatusPreconditionFailed)
@@ -1010,10 +992,10 @@ func (wn *WebsocketNetwork) ServeHTTP(response http.ResponseWriter, request *htt
 
 	matchingVersion, otherVersion := wn.checkProtocolVersionMatch(request.Header)
 	if matchingVersion == "" {
-		wn.log.Infof("new peer %s version mismatch, mine=%v theirs=%s, headers %#v", request.RemoteAddr, SupportedProtocolVersions, otherVersion, request.Header)
+		wn.log.Info(filterASCII(fmt.Sprintf("new peer %s version mismatch, mine=%v theirs=%s, headers %#v", request.RemoteAddr, SupportedProtocolVersions, otherVersion, request.Header)))
 		networkConnectionsDroppedTotal.Inc(map[string]string{"reason": "mismatching protocol version"})
 		response.WriteHeader(http.StatusPreconditionFailed)
-		message := fmt.Sprintf("Requested version %s not in %v mismatches server version", otherVersion, SupportedProtocolVersions)
+		message := fmt.Sprintf("Requested version %s not in %v mismatches server version", filterASCII(otherVersion), SupportedProtocolVersions)
 		n, err := response.Write([]byte(message))
 		if err != nil {
 			wn.log.Warnf("ws failed to write response '%s' : n = %d err = %v", message, n, err)
@@ -1119,9 +1101,15 @@ func (wn *WebsocketNetwork) messageHandlerThread() {
 				wn.wg.Add(1)
 				go wn.disconnectThread(msg.Sender, disconnectBadData)
 			case Broadcast:
-				wn.Broadcast(wn.ctx, msg.Tag, msg.Data, false, msg.Sender)
+				err := wn.Broadcast(wn.ctx, msg.Tag, msg.Data, false, msg.Sender)
+				if err != nil && err != errBcastQFull {
+					wn.log.Warnf("WebsocketNetwork.messageHandlerThread: WebsocketNetwork.Broadcast returned unexpected error %v", err)
+				}
 			case Respond:
-				msg.Sender.(*wsPeer).Respond(wn.ctx, msg, outmsg.Topics)
+				err := msg.Sender.(*wsPeer).Respond(wn.ctx, msg, outmsg.Topics)
+				if err != nil && err != wn.ctx.Err() {
+					wn.log.Warnf("WebsocketNetwork.messageHandlerThread: wsPeer.Respond returned unexpected error %v", err)
+				}
 			default:
 			}
 		case <-inactivityCheckTicker.C:
@@ -1169,7 +1157,10 @@ func (wn *WebsocketNetwork) checkSlowWritingPeers() {
 func (wn *WebsocketNetwork) sendFilterMessage(msg IncomingMessage) {
 	digest := generateMessageDigest(msg.Tag, msg.Data)
 	//wn.log.Debugf("send filter %s(%d) %v", msg.Tag, len(msg.Data), digest)
-	wn.Broadcast(context.Background(), protocol.MsgDigestSkipTag, digest[:], false, msg.Sender)
+	err := wn.Broadcast(context.Background(), protocol.MsgDigestSkipTag, digest[:], false, msg.Sender)
+	if err != nil && err != errBcastQFull {
+		wn.log.Warnf("WebsocketNetwork.sendFilterMessage: WebsocketNetwork.Broadcast returned unexpected error %v", err)
+	}
 }
 
 func (wn *WebsocketNetwork) broadcastThread() {
@@ -1372,12 +1363,15 @@ func (wn *WebsocketNetwork) meshThread() {
 		// TODO: only do DNS fetch every N seconds? Honor DNS TTL? Trust DNS library we're using to handle caching and TTL?
 		dnsBootstrapArray := wn.config.DNSBootstrapArray(wn.NetworkID)
 		for _, dnsBootstrap := range dnsBootstrapArray {
-			dnsAddrs := wn.getDNSAddrs(dnsBootstrap)
-			if len(dnsAddrs) > 0 {
-				wn.log.Debugf("got %d dns addrs, %#v", len(dnsAddrs), dnsAddrs[:imin(5, len(dnsAddrs))])
-				wn.phonebook.ReplacePeerList(dnsAddrs, dnsBootstrap)
+			relayAddrs, archiveAddrs := wn.getDNSAddrs(dnsBootstrap)
+			if len(relayAddrs) > 0 {
+				wn.log.Debugf("got %d relay dns addrs, %#v", len(relayAddrs), relayAddrs[:imin(5, len(relayAddrs))])
+				wn.phonebook.ReplacePeerList(relayAddrs, dnsBootstrap, PhoneBookEntryRelayRole)
 			} else {
-				wn.log.Infof("got no DNS addrs for network %s", wn.NetworkID)
+				wn.log.Infof("got no relay DNS addrs for network %s", wn.NetworkID)
+			}
+			if len(archiveAddrs) > 0 {
+				wn.phonebook.ReplacePeerList(archiveAddrs, dnsBootstrap, PhoneBookEntryArchiverRole)
 			}
 		}
 
@@ -1418,7 +1412,7 @@ func (wn *WebsocketNetwork) checkNewConnectionsNeeded() bool {
 		return false
 	}
 	// get more than we need so that we can ignore duplicates
-	newAddrs := wn.phonebook.GetAddresses(desired + numOutgoingTotal)
+	newAddrs := wn.phonebook.GetAddresses(desired+numOutgoingTotal, PhoneBookEntryRelayRole)
 	for _, na := range newAddrs {
 		if na == wn.config.PublicAddress {
 			// filter out self-public address, so we won't try to connect to outselves.
@@ -1664,16 +1658,27 @@ func (wn *WebsocketNetwork) peersToPing() []*wsPeer {
 	return out
 }
 
-func (wn *WebsocketNetwork) getDNSAddrs(dnsBootstrap string) []string {
-	srvPhonebook, err := tools_network.ReadFromSRV("algobootstrap", "tcp", dnsBootstrap, wn.config.FallbackDNSResolverAddress, wn.config.DNSSecuritySRVEnforced())
+func (wn *WebsocketNetwork) getDNSAddrs(dnsBootstrap string) (relaysAddresses []string, archiverAddresses []string) {
+	var err error
+	relaysAddresses, err = tools_network.ReadFromSRV("algobootstrap", "tcp", dnsBootstrap, wn.config.FallbackDNSResolverAddress, wn.config.DNSSecuritySRVEnforced())
 	if err != nil {
 		// only log this warning on testnet or devnet
 		if wn.NetworkID == config.Devnet || wn.NetworkID == config.Testnet {
-			wn.log.Warnf("Cannot lookup SRV record for %s: %v", dnsBootstrap, err)
+			wn.log.Warnf("Cannot lookup algobootstrap SRV record for %s: %v", dnsBootstrap, err)
 		}
-		return nil
+		relaysAddresses = nil
 	}
-	return srvPhonebook
+	if wn.config.EnableCatchupFromArchiveServers {
+		archiverAddresses, err = tools_network.ReadFromSRV("archive", "tcp", dnsBootstrap, wn.config.FallbackDNSResolverAddress, wn.config.DNSSecuritySRVEnforced())
+		if err != nil {
+			// only log this warning on testnet or devnet
+			if wn.NetworkID == config.Devnet || wn.NetworkID == config.Testnet {
+				wn.log.Warnf("Cannot lookup archive SRV record for %s: %v", dnsBootstrap, err)
+			}
+			archiverAddresses = nil
+		}
+	}
+	return
 }
 
 // ProtocolVersionHeader HTTP header for protocol version.
@@ -1797,6 +1802,23 @@ func (wn *WebsocketNetwork) GetRoundTripper() http.RoundTripper {
 	return &wn.transport
 }
 
+// filterASCII filter out the non-ascii printable characters out of the given input string and
+// and replace these with unprintableCharacterGlyph.
+// It's used as a security qualifier before logging a network-provided data.
+// The function allows only characters in the range of [32..126], which excludes all the
+// control character, new lines, deletion, etc. All the alpha numeric and punctuation characters
+// are included in this range.
+func filterASCII(unfilteredString string) (filteredString string) {
+	for i, r := range unfilteredString {
+		if int(r) >= 0x20 && int(r) <= 0x7e {
+			filteredString += string(unfilteredString[i])
+		} else {
+			filteredString += unprintableCharacterGlyph
+		}
+	}
+	return
+}
+
 // tryConnect opens websocket connection and checks initial connection parameters.
 // addr should be 'host:port' or a URL, gossipAddr is the websocket endpoint URL
 func (wn *WebsocketNetwork) tryConnect(addr, gossipAddr string) {
@@ -1835,6 +1857,7 @@ func (wn *WebsocketNetwork) tryConnect(addr, gossipAddr string) {
 			if len(errString) > 128 {
 				errString = errString[:128]
 			}
+			errString = filterASCII(errString)
 
 			// we're guaranteed to have a valid response object.
 			switch response.StatusCode {
@@ -1921,7 +1944,7 @@ func (wn *WebsocketNetwork) tryConnect(addr, gossipAddr string) {
 func NewWebsocketNetwork(log logging.Logger, config config.Local, phonebookAddresses []string, genesisID string, networkID protocol.NetworkID) (wn *WebsocketNetwork, err error) {
 	phonebook := MakePhonebook(config.ConnectionsRateLimitingCount,
 		time.Duration(config.ConnectionsRateLimitingWindowSeconds)*time.Second)
-	phonebook.ReplacePeerList(phonebookAddresses, config.DNSBootstrapID)
+	phonebook.ReplacePeerList(phonebookAddresses, config.DNSBootstrapID, PhoneBookEntryRelayRole)
 	wn = &WebsocketNetwork{
 		log:       log,
 		config:    config,
@@ -2013,7 +2036,7 @@ func (wn *WebsocketNetwork) addPeer(peer *wsPeer) {
 	defer wn.peersLock.Unlock()
 	for _, p := range wn.peers {
 		if p == peer {
-			wn.log.Error("dup peer added %#v", peer)
+			wn.log.Errorf("dup peer added %#v", peer)
 			return
 		}
 	}
@@ -2098,4 +2121,9 @@ func (wn *WebsocketNetwork) RegisterMessageInterest(t protocol.Tag) error {
 
 	wn.messagesOfInterest[t] = true
 	return nil
+}
+
+// SubstituteGenesisID substitutes the "{genesisID}" with their network-specific genesisID.
+func (wn *WebsocketNetwork) SubstituteGenesisID(rawURL string) string {
+	return strings.Replace(rawURL, "{genesisID}", wn.GenesisID, -1)
 }

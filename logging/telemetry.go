@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -85,18 +85,19 @@ func makeTelemetryState(cfg TelemetryConfig, hookFactory hookFactory) (*telemetr
 	} else {
 		telemetry.hook = new(dummyHook)
 	}
-	telemetry.sendToLog = cfg.SendToLog
+	telemetry.telemetryConfig = cfg
 	return telemetry, nil
 }
 
 // ReadTelemetryConfigOrDefault reads telemetry config from file or defaults if no config file found.
-func ReadTelemetryConfigOrDefault(dataDir *string, genesisID string) (cfg TelemetryConfig, err error) {
+func ReadTelemetryConfigOrDefault(dataDir string, genesisID string) (cfg TelemetryConfig, err error) {
 	err = nil
-	if dataDir != nil && *dataDir != "" {
-		configPath := filepath.Join(*dataDir, TelemetryConfigFilename)
+	dataDirProvided := dataDir != ""
+	if dataDirProvided {
+		configPath := filepath.Join(dataDir, TelemetryConfigFilename)
 		cfg, err = LoadTelemetryConfig(configPath)
 	}
-	if err != nil && os.IsNotExist(err) {
+	if (err != nil && os.IsNotExist(err)) || !dataDirProvided {
 		var configPath string
 		configPath, err = config.GetConfigFilePath(TelemetryConfigFilename)
 		if err != nil {
@@ -148,7 +149,6 @@ func EnsureTelemetryConfigCreated(dataDir *string, genesisID string) (TelemetryC
 		configPath, err = config.GetConfigFilePath(TelemetryConfigFilename)
 		if err != nil {
 			cfg := createTelemetryConfig()
-			initializeConfig(cfg)
 			return cfg, true, err
 		}
 		cfg, err = LoadTelemetryConfig(configPath)
@@ -171,7 +171,6 @@ func EnsureTelemetryConfigCreated(dataDir *string, genesisID string) (TelemetryC
 	}
 	cfg.ChainID = fmt.Sprintf("%s-%s", ch, genesisID)
 
-	initializeConfig(cfg)
 	return cfg, created, err
 }
 
@@ -224,7 +223,7 @@ func (t *telemetryState) logTelemetry(l logger, message string, details interfac
 	entry.Level = logrus.InfoLevel
 	entry.Message = message
 
-	if t.sendToLog {
+	if t.telemetryConfig.SendToLog {
 		entry.Info(message)
 	}
 	t.hook.Fire(entry)

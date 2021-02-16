@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -30,7 +30,7 @@ func TestAccountsCanClose(t *testing.T) {
 	a := require.New(t)
 
 	var fixture fixtures.RestClientFixture
-	fixture.Setup(t, filepath.Join("nettemplates", "TwoNodes50EachV10.json"))
+	fixture.Setup(t, filepath.Join("nettemplates", "TwoNodes50EachV15.json"))
 	defer fixture.Shutdown()
 	client := fixture.LibGoalClient
 

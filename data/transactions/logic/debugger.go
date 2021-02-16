@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -76,13 +76,14 @@ type DebugState struct {
 	Error   string             `codec:"error"`
 
 	// global/local state changes are updated every step. Stateful TEAL only.
-	AppStateChange
+	basics.EvalDelta
 }
 
-// AppStateChange encapsulates global and local app state changes
-type AppStateChange struct {
-	GlobalStateChanges basics.StateDelta                    `codec:"gsch"`
-	LocalStateChanges  map[basics.Address]basics.StateDelta `codec:"lsch"`
+// GetProgramID returns program or execution ID that is string representation of sha256 checksum.
+// It is used later to link program on the user-facing side of the debugger with TEAL evaluator.
+func GetProgramID(program []byte) string {
+	hash := sha256.Sum256([]byte(program))
+	return hex.EncodeToString(hash[:])
 }
 
 func makeDebugState(cx *evalContext) DebugState {
@@ -92,10 +93,9 @@ func makeDebugState(cx *evalContext) DebugState {
 		disasm = err.Error()
 	}
 
-	hash := sha256.Sum256(cx.program)
 	// initialize DebuggerState with immutable fields
 	ds := DebugState{
-		ExecID:      hex.EncodeToString(hash[:]),
+		ExecID:      GetProgramID(cx.program),
 		Disassembly: disasm,
 		PCOffset:    dsInfo.pcOffset,
 		GroupIndex:  cx.GroupIndex,
@@ -115,13 +115,13 @@ func makeDebugState(cx *evalContext) DebugState {
 
 	// pre-allocate state maps
 	if (cx.runModeFlags & runModeApplication) != 0 {
-		ds.GlobalStateChanges = make(basics.StateDelta)
-
-		// allocate maximum possible slots in the hashmap even if Txn.Accounts might have duplicate entries
-		locals := 1 + len(cx.Txn.Txn.Accounts) // sender + referenced accounts
-		ds.LocalStateChanges = make(map[basics.Address]basics.StateDelta, locals)
-
-		// do not pre-allocate ds.LocalStateChanges[addr] since it initialized during update
+		ds.EvalDelta, err = cx.Ledger.GetDelta(&cx.Txn.Txn)
+		if err != nil {
+			sv := stackValue{Bytes: []byte(err.Error())}
+			tv := stackValueToTealValue(&sv)
+			vd := tv.ToValueDelta()
+			ds.EvalDelta.GlobalDelta = basics.StateDelta{"error": vd}
+		}
 	}
 
 	return ds
@@ -185,6 +185,7 @@ func stackValueToTealValue(sv *stackValue) basics.TealValue {
 	}
 }
 
+// valueDeltaToValueDelta converts delta's bytes to base64 in a new struct
 func valueDeltaToValueDelta(vd *basics.ValueDelta) basics.ValueDelta {
 	return basics.ValueDelta{
 		Action: vd.Action,
@@ -217,17 +218,13 @@ func (cx *evalContext) refreshDebugState() *DebugState {
 	ds.Scratch = scratch
 
 	if (cx.runModeFlags & runModeApplication) != 0 {
-		if cx.globalStateCow != nil {
-			for k, v := range cx.globalStateCow.delta {
-				ds.GlobalStateChanges[k] = valueDeltaToValueDelta(&v)
-			}
-		}
-		for addr, cow := range cx.localStateCows {
-			delta := make(basics.StateDelta, len(cow.cow.delta))
-			for k, v := range cow.cow.delta {
-				delta[k] = valueDeltaToValueDelta(&v)
-			}
-			ds.LocalStateChanges[addr] = delta
+		var err error
+		ds.EvalDelta, err = cx.Ledger.GetDelta(&cx.Txn.Txn)
+		if err != nil {
+			sv := stackValue{Bytes: []byte(err.Error())}
+			tv := stackValueToTealValue(&sv)
+			vd := tv.ToValueDelta()
+			ds.EvalDelta.GlobalDelta = basics.StateDelta{"error": vd}
 		}
 	}
 

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -114,7 +114,7 @@ func (pl partialLayer) up(s *siblings, l uint64, doHash bool) (partialLayer, err
 				p.l = siblingHash
 				p.r = posHash
 			}
-			nextLayerHash = crypto.HashObj(&p)
+			nextLayerHash = p.Hash()
 		}
 
 		res = append(res, layerItem{

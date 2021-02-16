@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -184,7 +184,7 @@ func main() {
 		telemetryConfig.SendToLog = telemetryConfig.SendToLog || cfg.TelemetryToLog
 
 		// Apply telemetry override.
-		telemetryConfig.Enable = logging.TelemetryOverride(*telemetryOverride)
+		telemetryConfig.Enable = logging.TelemetryOverride(*telemetryOverride, &telemetryConfig)
 		remoteTelemetryEnabled = telemetryConfig.Enable
 
 		if telemetryConfig.Enable || telemetryConfig.SendToLog {
@@ -289,10 +289,11 @@ func main() {
 		}
 	}
 
-	err = s.Initialize(cfg, phonebookAddresses)
+	err = s.Initialize(cfg, phonebookAddresses, string(genesisText))
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		log.Error(err)
+		os.Exit(1)
 		return
 	}
 

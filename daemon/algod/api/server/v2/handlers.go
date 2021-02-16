@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -36,7 +36,7 @@ import (
 	"github.com/algorand/go-algorand/data/bookkeeping"
 	"github.com/algorand/go-algorand/data/transactions"
 	"github.com/algorand/go-algorand/data/transactions/logic"
-	"github.com/algorand/go-algorand/ledger"
+	"github.com/algorand/go-algorand/ledger/ledgercore"
 	"github.com/algorand/go-algorand/logging"
 	"github.com/algorand/go-algorand/node"
 	"github.com/algorand/go-algorand/protocol"
@@ -110,7 +110,7 @@ func (v2 *Handlers) AccountInformation(ctx echo.Context, address string, params 
 		return ctx.Blob(http.StatusOK, contentType, data)
 	}
 
-	recordWithoutPendingRewards, err := myLedger.LookupWithoutRewards(lastRound, addr)
+	recordWithoutPendingRewards, _, err := myLedger.LookupWithoutRewards(lastRound, addr)
 	if err != nil {
 		return internalError(ctx, err, errFailedLookingUpLedger, v2.Log)
 	}
@@ -222,6 +222,7 @@ func (v2 *Handlers) GetStatus(ctx echo.Context) error {
 		Catchpoint:                  &stat.Catchpoint,
 		CatchpointTotalAccounts:     &stat.CatchpointCatchupTotalAccounts,
 		CatchpointProcessedAccounts: &stat.CatchpointCatchupProcessedAccounts,
+		CatchpointVerifiedAccounts:  &stat.CatchpointCatchupVerifiedAccounts,
 		CatchpointTotalBlocks:       &stat.CatchpointCatchupTotalBlocks,
 		CatchpointAcquiredBlocks:    &stat.CatchpointCatchupAcquiredBlocks,
 	}
@@ -358,19 +359,18 @@ func (v2 *Handlers) TealDryrun(ctx echo.Context) error {
 
 	var response generated.DryrunResponse
 
-	var proto config.ConsensusParams
 	var protocolVersion protocol.ConsensusVersion
 	if dr.ProtocolVersion != "" {
 		var ok bool
-		proto, ok = config.Consensus[protocol.ConsensusVersion(dr.ProtocolVersion)]
+		_, ok = config.Consensus[protocol.ConsensusVersion(dr.ProtocolVersion)]
 		if !ok {
 			return badRequest(ctx, nil, "unsupported protocol version", v2.Log)
 		}
 		protocolVersion = protocol.ConsensusVersion(dr.ProtocolVersion)
 	} else {
-		proto = config.Consensus[hdr.CurrentProtocol]
 		protocolVersion = hdr.CurrentProtocol
 	}
+	dr.ProtocolVersion = string(protocolVersion)
 
 	if dr.Round == 0 {
 		dr.Round = uint64(hdr.Round + 1)
@@ -380,7 +380,7 @@ func (v2 *Handlers) TealDryrun(ctx echo.Context) error {
 		dr.LatestTimestamp = hdr.TimeStamp
 	}
 
-	doDryrunRequest(&dr, &proto, &response)
+	doDryrunRequest(&dr, &response)
 	response.ProtocolVersion = string(protocolVersion)
 	return ctx.JSON(http.StatusOK, response)
 }
@@ -442,17 +442,18 @@ func (v2 *Handlers) PendingTransactionInformation(ctx echo.Context, txid string,
 
 	// Encoding wasn't working well without embedding "real" objects.
 	response := struct {
-		AssetIndex       *uint64                        `codec:"asset-index,omitempty"`
-		ApplicationIndex *uint64                        `codec:"application-index,omitempty"`
-		CloseRewards     *uint64                        `codec:"close-rewards,omitempty"`
-		ClosingAmount    *uint64                        `codec:"closing-amount,omitempty"`
-		ConfirmedRound   *uint64                        `codec:"confirmed-round,omitempty"`
-		GlobalStateDelta *generated.StateDelta          `codec:"global-state-delta,omitempty"`
-		LocalStateDelta  *[]generated.AccountStateDelta `codec:"local-state-delta,omitempty"`
-		PoolError        string                         `codec:"pool-error"`
-		ReceiverRewards  *uint64                        `codec:"receiver-rewards,omitempty"`
-		SenderRewards    *uint64                        `codec:"sender-rewards,omitempty"`
-		Txn              transactions.SignedTxn         `codec:"txn"`
+		AssetIndex         *uint64                        `codec:"asset-index,omitempty"`
+		AssetClosingAmount *uint64                        `codec:"asset-closing-amount,omitempty"`
+		ApplicationIndex   *uint64                        `codec:"application-index,omitempty"`
+		CloseRewards       *uint64                        `codec:"close-rewards,omitempty"`
+		ClosingAmount      *uint64                        `codec:"closing-amount,omitempty"`
+		ConfirmedRound     *uint64                        `codec:"confirmed-round,omitempty"`
+		GlobalStateDelta   *generated.StateDelta          `codec:"global-state-delta,omitempty"`
+		LocalStateDelta    *[]generated.AccountStateDelta `codec:"local-state-delta,omitempty"`
+		PoolError          string                         `codec:"pool-error"`
+		ReceiverRewards    *uint64                        `codec:"receiver-rewards,omitempty"`
+		SenderRewards      *uint64                        `codec:"sender-rewards,omitempty"`
+		Txn                transactions.SignedTxn         `codec:"txn"`
 	}{
 		Txn: txn.Txn,
 	}
@@ -467,6 +468,7 @@ func (v2 *Handlers) PendingTransactionInformation(ctx echo.Context, txid string,
 		response.ConfirmedRound = &r
 
 		response.ClosingAmount = &txn.ApplyData.ClosingAmount.Raw
+		response.AssetClosingAmount = &txn.ApplyData.AssetClosingAmount
 		response.SenderRewards = &txn.ApplyData.SenderRewards.Raw
 		response.ReceiverRewards = &txn.ApplyData.ReceiverRewards.Raw
 		response.CloseRewards = &txn.ApplyData.CloseRewards.Raw
@@ -558,24 +560,33 @@ func (v2 *Handlers) getPendingTransactions(ctx echo.Context, max *uint64, format
 
 // startCatchup Given a catchpoint, it starts catching up to this catchpoint
 func (v2 *Handlers) startCatchup(ctx echo.Context, catchpoint string) error {
-	_, _, err := ledger.ParseCatchpointLabel(catchpoint)
+	_, _, err := ledgercore.ParseCatchpointLabel(catchpoint)
 	if err != nil {
 		return badRequest(ctx, err, errFailedToParseCatchpoint, v2.Log)
 	}
 
+	// Select 200/201, or return an error
+	var code int
 	err = v2.Node.StartCatchup(catchpoint)
-	if err != nil {
+	switch err.(type) {
+	case nil:
+		code = http.StatusCreated
+	case *node.CatchpointAlreadyInProgressError:
+		code = http.StatusOK
+	case *node.CatchpointUnableToStartError:
+		return badRequest(ctx, err, err.Error(), v2.Log)
+	default:
 		return internalError(ctx, err, fmt.Sprintf(errFailedToStartCatchup, err), v2.Log)
 	}
 
-	return ctx.JSON(http.StatusOK, private.CatchpointStartResponse{
+	return ctx.JSON(code, private.CatchpointStartResponse{
 		CatchupMessage: catchpoint,
 	})
 }
 
 // abortCatchup Given a catchpoint, it aborts catching up to this catchpoint
 func (v2 *Handlers) abortCatchup(ctx echo.Context, catchpoint string) error {
-	_, _, err := ledger.ParseCatchpointLabel(catchpoint)
+	_, _, err := ledgercore.ParseCatchpointLabel(catchpoint)
 	if err != nil {
 		return badRequest(ctx, err, errFailedToParseCatchpoint, v2.Log)
 	}
@@ -610,7 +621,7 @@ func (v2 *Handlers) GetApplicationByID(ctx echo.Context, applicationID uint64) e
 	}
 
 	lastRound := ledger.Latest()
-	record, err := ledger.Lookup(lastRound, creator)
+	record, _, err := ledger.LookupWithoutRewards(lastRound, creator)
 	if err != nil {
 		return internalError(ctx, err, errFailedLookingUpLedger, v2.Log)
 	}
@@ -682,16 +693,15 @@ func (v2 *Handlers) TealCompile(ctx echo.Context) error {
 	ctx.Request().Body = http.MaxBytesReader(nil, ctx.Request().Body, maxTealSourceBytes)
 	buf.ReadFrom(ctx.Request().Body)
 	source := buf.String()
-	program, err := logic.AssembleString(source)
+	ops, err := logic.AssembleString(source)
 	if err != nil {
 		return badRequest(ctx, err, err.Error(), v2.Log)
 	}
-
-	pd := logic.HashProgram(program)
+	pd := logic.HashProgram(ops.Program)
 	addr := basics.Address(pd)
 	response := generated.CompileResponse{
 		Hash:   addr.String(),
-		Result: base64.StdEncoding.EncodeToString(program),
+		Result: base64.StdEncoding.EncodeToString(ops.Program),
 	}
 	return ctx.JSON(http.StatusOK, response)
 }

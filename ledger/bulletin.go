@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -23,15 +23,16 @@ import (
 
 	"github.com/algorand/go-algorand/data/basics"
 	"github.com/algorand/go-algorand/data/bookkeeping"
+	"github.com/algorand/go-algorand/ledger/ledgercore"
 )
 
-// notifier is a struct that encapsulates a single-shot channel; it will only be signalled once.
+// notifier is a struct that encapsulates a single-shot channel; it will only be signaled once.
 type notifier struct {
 	signal   chan struct{}
 	notified uint32
 }
 
-// makeNotifier constructs a notifier that has not been signalled.
+// makeNotifier constructs a notifier that has not been signaled.
 func makeNotifier() notifier {
 	return notifier{signal: make(chan struct{}), notified: 0}
 }
@@ -86,7 +87,7 @@ func (b *bulletin) loadFromDisk(l ledgerForTracker) error {
 func (b *bulletin) close() {
 }
 
-func (b *bulletin) newBlock(blk bookkeeping.Block, delta StateDelta) {
+func (b *bulletin) newBlock(blk bookkeeping.Block, delta ledgercore.StateDelta) {
 }
 
 func (b *bulletin) committedUpTo(rnd basics.Round) basics.Round {

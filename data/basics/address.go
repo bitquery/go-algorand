@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -49,6 +49,8 @@ func (addr Address) GetUserAddress() string {
 }
 
 // UnmarshalChecksumAddress tries to unmarshal the checksummed address string.
+// Algorand strings addresses ( base32 encoded ) have a postamble which serves as the checksum of the address.
+// When converted to an Address object representation, that checksum is dropped (after validation).
 func UnmarshalChecksumAddress(address string) (Address, error) {
 	decoded, err := base32Encoder.DecodeString(address)
 

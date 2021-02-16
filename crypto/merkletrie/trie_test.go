@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -30,7 +30,7 @@ const (
 )
 
 func TestAddingAndRemoving(t *testing.T) {
-	mt, _ := MakeTrie(nil, defaultTestEvictSize)
+	mt, _ := MakeTrie(nil, defaultTestMemoryConfig)
 	// create 10000 hashes.
 	hashes := make([]crypto.Digest, 10000)
 	for i := 0; i < len(hashes); i++ {
@@ -82,7 +82,7 @@ func TestAddingAndRemoving(t *testing.T) {
 }
 
 func TestRandomAddingAndRemoving(t *testing.T) {
-	mt, err := MakeTrie(nil, defaultTestEvictSize)
+	mt, err := MakeTrie(nil, defaultTestMemoryConfig)
 	require.NoError(t, err)
 
 	// create 10000 hashes.
@@ -131,7 +131,7 @@ func TestRandomAddingAndRemoving(t *testing.T) {
 			nextOperation = 1
 		}
 		if (i % (1 + int(processesHash[0]))) == 42 {
-			err := mt.Commit()
+			_, err := mt.Commit()
 			require.NoError(t, err)
 			verifyCacheNodeCount(t, mt)
 		}

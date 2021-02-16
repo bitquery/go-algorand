@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -838,4 +838,41 @@ func TestVoteAggregatorFiltersVoteNextRound(t *testing.T) {
 	res, err := b.Build().Validate(voteM)
 	require.NoError(t, err)
 	require.NoErrorf(t, res, "Votes from next round not correctly filtered")
+}
+
+func TestVoteAggregatorOldVote(t *testing.T) {
+	cparams := config.Consensus[protocol.ConsensusCurrentVersion]
+	maxNumBlocks := 2 * cparams.SeedRefreshInterval * cparams.SeedLookback
+	ledger := makeTestLedgerMaxBlocks(readOnlyGenesis100, maxNumBlocks)
+	addresses, vrfSecrets, otSecrets := readOnlyAddrs100, readOnlyVRF100, readOnlyOT100
+	round := ledger.NextRound()
+	period := period(0)
+
+	var proposal proposalValue
+	proposal.BlockDigest = randomBlockHash()
+
+	var uvs []unauthenticatedVote
+	for i := range addresses {
+		address := addresses[i]
+		step := step(1)
+		rv := rawVote{Sender: address, Round: round, Period: period, Step: step, Proposal: proposal}
+		uv, err := makeVote(rv, otSecrets[i], vrfSecrets[i], ledger)
+		assert.NoError(t, err)
+		uvs = append(uvs, uv)
+	}
+
+	for r := 1; r < 1000; r++ {
+		ledger.EnsureBlock(makeRandomBlock(ledger.NextRound()), Certificate{})
+	}
+
+	avv := MakeAsyncVoteVerifier(nil)
+	defer avv.Quit()
+
+	results := make(chan asyncVerifyVoteResponse, len(uvs))
+
+	for i, uv := range uvs {
+		avv.verifyVote(context.Background(), ledger, uv, i, message{}, results)
+		result := <-results
+		require.True(t, result.cancelled)
+	}
 }

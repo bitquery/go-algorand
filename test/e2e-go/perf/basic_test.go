@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -51,7 +51,7 @@ func queuePayments(b *testing.B, wg *sync.WaitGroup, c libgoal.Client, q <-chan 
 			}
 
 			fmt.Printf("Error broadcasting transaction: %v\n", err)
-			time.Sleep(2 * config.Protocol.SmallLambda)
+			time.Sleep(config.Consensus[protocol.ConsensusCurrentVersion].AgreementFilterTimeout)
 		}
 	}
 

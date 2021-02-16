@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -103,7 +103,7 @@ func (d *DNS) ClearSRVRecord(ctx context.Context, name string, target string, se
 		return err
 	}
 	if len(entries) == 0 {
-		fmt.Printf("No SRV entry for '%s'='%s'.\n", name, target)
+		fmt.Printf("No SRV entry for '[%s.%s.]%s'='%s'.\n", service, protocol, name, target)
 		return nil
 	}
 

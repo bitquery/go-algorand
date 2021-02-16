@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -18,7 +18,6 @@ package upgrades
 
 import (
 	"math/rand"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -43,38 +42,6 @@ func GenerateRandomBytes(n int) []byte {
 
 // this test checks that two accounts can send money to one another
 // across a protocol upgrade.
-func TestAccountsCanSendMoneyAcrossUpgradeV7toV8(t *testing.T) {
-	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV7Upgrade.json"))
-}
-
-func TestAccountsCanSendMoneyAcrossUpgradeV8toV9(t *testing.T) {
-	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV8Upgrade.json"))
-}
-
-func TestAccountsCanSendMoneyAcrossUpgradeV9toV10(t *testing.T) {
-	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV9Upgrade.json"))
-}
-
-func TestAccountsCanSendMoneyAcrossUpgradeV10toV11(t *testing.T) {
-	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV10Upgrade.json"))
-}
-
-func TestAccountsCanSendMoneyAcrossUpgradeV11toV12(t *testing.T) {
-	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV11Upgrade.json"))
-}
-
-func TestAccountsCanSendMoneyAcrossUpgradeV12toV13(t *testing.T) {
-	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV12Upgrade.json"))
-}
-
-func TestAccountsCanSendMoneyAcrossUpgradeV13toV14(t *testing.T) {
-	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV13Upgrade.json"))
-}
-
-func TestAccountsCanSendMoneyAcrossUpgradeV14toV15(t *testing.T) {
-	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV14Upgrade.json"))
-}
-
 func TestAccountsCanSendMoneyAcrossUpgradeV15toV16(t *testing.T) {
 	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV15Upgrade.json"))
 }
@@ -89,6 +56,10 @@ func TestAccountsCanSendMoneyAcrossUpgradeV22toV23(t *testing.T) {
 
 func TestAccountsCanSendMoneyAcrossUpgradeV23toV24(t *testing.T) {
 	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV23Upgrade.json"))
+}
+
+func TestAccountsCanSendMoneyAcrossUpgradeV24toV25(t *testing.T) {
+	testAccountsCanSendMoneyAcrossUpgrade(t, filepath.Join("nettemplates", "TwoNodes50EachV24Upgrade.json"))
 }
 
 // ConsensusTestFastUpgrade is meant for testing of protocol upgrades:
@@ -117,6 +88,10 @@ func generateFastUpgradeConsensus() (fastUpgradeProtocols config.ConsensusProtoc
 		}
 
 		fastUpgradeProtocols[consensusTestFastUpgrade(proto)] = fastParams
+
+		// set the small lambda to 500 for the duration of dependent tests.
+		fastParams.AgreementFilterTimeout = time.Second
+		fastParams.AgreementFilterTimeoutPeriod0 = time.Second
 	}
 	return
 }
@@ -124,7 +99,6 @@ func generateFastUpgradeConsensus() (fastUpgradeProtocols config.ConsensusProtoc
 func testAccountsCanSendMoneyAcrossUpgrade(t *testing.T, templatePath string) {
 	t.Parallel()
 	a := require.New(t)
-	os.Setenv("ALGOSMALLLAMBDAMSEC", "500")
 
 	consensus := generateFastUpgradeConsensus()
 

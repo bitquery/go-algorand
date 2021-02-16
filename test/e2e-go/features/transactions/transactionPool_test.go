@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -39,9 +39,8 @@ func TestTransactionPoolOrderingAndClearing(t *testing.T) {
 	// stop the other node in this network so that no new blocks are produced
 	otherNode, err := fixture.GetNodeController("Node")
 	r.NoError(err, "should be able to get other node's controller")
-	alreadyStopped, err := otherNode.StopAlgod()
+	err = otherNode.StopAlgod()
 	r.NoError(err, "should be able to stop other node")
-	r.False(alreadyStopped, "other node should have been running when it was stopped")
 	// get the round that the network was stopped on, it will be used when the network restarts
 	curStatus, _ := c.Status()
 	stoppedRound := curStatus.LastRound
@@ -126,9 +125,8 @@ func TestTransactionPoolExponentialFees(t *testing.T) {
 	// stop the other node in this network so that no new blocks are produced
 	otherNode, err := fixture.GetNodeController("Node")
 	r.NoError(err, "should be able to get other node's controller")
-	alreadyStopped, err := otherNode.StopAlgod()
+	err = otherNode.StopAlgod()
 	r.NoError(err, "should be able to stop other node")
-	r.False(alreadyStopped, "other node should have been running when it was stopped")
 	// put transactions in the pool - they cannot be removed from the pool while the node is stopped
 	transactionPoolSize := 50000
 	sourceAccount, err := fixture.GetRichestAccount()

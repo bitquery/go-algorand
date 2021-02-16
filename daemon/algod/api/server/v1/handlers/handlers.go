@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -17,6 +17,7 @@
 package handlers
 
 import (
+	"database/sql"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -38,7 +39,7 @@ import (
 	"github.com/algorand/go-algorand/data/bookkeeping"
 	"github.com/algorand/go-algorand/data/transactions"
 	"github.com/algorand/go-algorand/data/transactions/logic"
-	"github.com/algorand/go-algorand/ledger"
+	"github.com/algorand/go-algorand/ledger/ledgercore"
 	"github.com/algorand/go-algorand/node"
 	"github.com/algorand/go-algorand/protocol"
 	"github.com/algorand/go-algorand/rpcs"
@@ -93,6 +94,8 @@ func txEncode(signedTx transactions.SignedTxn, ad transactions.ApplyData) (v1.Tr
 		res = assetFreezeTxEncode(tx, ad)
 	case protocol.ApplicationCallTx:
 		res = applicationCallTxEncode(tx, ad)
+	case protocol.CompactCertTx:
+		res = compactCertTxEncode(tx, ad)
 	default:
 		return res, errors.New(errUnknownTransactionType)
 	}
@@ -348,6 +351,10 @@ func assetTransferTxEncode(tx transactions.Transaction, ad transactions.ApplyDat
 		xfer.CloseTo = tx.AssetTransferTxnFields.AssetCloseTo.String()
 	}
 
+	if ad.AssetClosingAmount != 0 {
+		xfer.CloseToAmount = ad.AssetClosingAmount
+	}
+
 	return v1.Transaction{
 		AssetTransfer: &xfer,
 	}
@@ -362,6 +369,17 @@ func assetFreezeTxEncode(tx transactions.Transaction, ad transactions.ApplyData)
 
 	return v1.Transaction{
 		AssetFreeze: &freeze,
+	}
+}
+
+func compactCertTxEncode(tx transactions.Transaction, ad transactions.ApplyData) v1.Transaction {
+	cc := v1.CompactCertTransactionType{
+		CertRound: uint64(tx.CompactCertTxnFields.CertRound),
+		Cert:      protocol.Encode(&tx.CompactCertTxnFields.Cert),
+	}
+
+	return v1.Transaction{
+		CompactCert: &cc,
 	}
 }
 
@@ -489,6 +507,13 @@ func blockEncode(b bookkeeping.Block, c agreement.Certificate) (v1.Block, error)
 			UpgradePropose: string(b.UpgradePropose),
 			UpgradeApprove: b.UpgradeApprove,
 		},
+		CompactCertVotersTotal: b.CompactCert[protocol.CompactCertBasic].CompactCertVotersTotal.ToUint64(),
+		CompactCertNextRound:   uint64(b.CompactCert[protocol.CompactCertBasic].CompactCertNextRound),
+	}
+
+	if !b.CompactCert[protocol.CompactCertBasic].CompactCertVoters.IsZero() {
+		voters := b.CompactCert[protocol.CompactCertBasic].CompactCertVoters
+		block.CompactCertVoters = voters[:]
 	}
 
 	// Transactions
@@ -773,7 +798,7 @@ func AccountInformation(ctx lib.ReqContext, context echo.Context) {
 		lib.ErrorResponse(w, http.StatusInternalServerError, err, errFailedLookingUpLedger, ctx.Log)
 		return
 	}
-	recordWithoutPendingRewards, err := ledger.LookupWithoutRewards(lastRound, basics.Address(addr))
+	recordWithoutPendingRewards, _, err := ledger.LookupWithoutRewards(lastRound, basics.Address(addr))
 	if err != nil {
 		lib.ErrorResponse(w, http.StatusInternalServerError, err, errFailedLookingUpLedger, ctx.Log)
 		return
@@ -1357,20 +1382,28 @@ func Assets(ctx lib.ReqContext, context echo.Context) {
 
 	const maxAssetsToList = 100
 
+	var err error
+	var max int64 = maxAssetsToList
+	var assetIdx int64 = 0
+
 	// Parse max assets to fetch from db
-	max, err := strconv.ParseInt(r.FormValue("max"), 10, 64)
-	if err != nil || max < 0 || max > maxAssetsToList {
-		err := fmt.Errorf(errFailedParsingMaxAssetsToList, 0, maxAssetsToList)
-		lib.ErrorResponse(w, http.StatusBadRequest, err, err.Error(), ctx.Log)
-		return
+	if r.PostFormValue("max") != "" {
+		max, err = strconv.ParseInt(r.FormValue("max"), 10, 64)
+		if err != nil || max < 0 || max > maxAssetsToList {
+			err := fmt.Errorf(errFailedParsingMaxAssetsToList, 0, maxAssetsToList)
+			lib.ErrorResponse(w, http.StatusBadRequest, err, err.Error(), ctx.Log)
+			return
+		}
 	}
 
 	// Parse maximum asset idx
-	assetIdx, err := strconv.ParseInt(r.FormValue("assetIdx"), 10, 64)
-	if err != nil || assetIdx < 0 {
-		errs := errFailedParsingAssetIdx
-		lib.ErrorResponse(w, http.StatusBadRequest, errors.New(errs), errs, ctx.Log)
-		return
+	if r.PostFormValue("assetIdx") != "" {
+		assetIdx, err = strconv.ParseInt(r.FormValue("assetIdx"), 10, 64)
+		if err != nil || assetIdx < 0 {
+			errs := errFailedParsingAssetIdx
+			lib.ErrorResponse(w, http.StatusBadRequest, errors.New(errs), errs, ctx.Log)
+			return
+		}
 	}
 
 	// If assetIdx is 0, we want the most recent assets, so make it intmax
@@ -1643,7 +1676,7 @@ func Transactions(ctx lib.ReqContext, context echo.Context) {
 	// swagger:operation GET /v1/account/{address}/transactions Transactions
 	// ---
 	//     Summary: Get a list of confirmed transactions.
-	//     Description: Returns the list of confirmed transactions between within a date range. This call is available only when the indexer is running.
+	//     Description: Returns the list of confirmed transactions between within a date range. When indexer is disabled this call requires firstRound and lastRound and returns an error if firstRound is not available to the node. The transaction results start from the oldest round.
 	//     Produces:
 	//     - application/json
 	//     Schemes:
@@ -1740,7 +1773,7 @@ func Transactions(ctx lib.ReqContext, context echo.Context) {
 		txs, err = ctx.Node.ListTxns(addr, basics.Round(fR), basics.Round(lR))
 		if err != nil {
 			switch err.(type) {
-			case ledger.ErrNoEntry:
+			case ledgercore.ErrNoEntry:
 				if !ctx.Node.IsArchival() {
 					lib.ErrorResponse(w, http.StatusInternalServerError, err, errBlockHashBeenDeletedArchival, ctx.Log)
 					return
@@ -1874,6 +1907,10 @@ func GetTransactionByID(ctx lib.ReqContext, context echo.Context) {
 	}
 
 	rnd, err := indexer.GetRoundByTXID(queryTxID)
+	if err == sql.ErrNoRows {
+		lib.ErrorResponse(w, http.StatusNotFound, err, errTransactionNotFound, ctx.Log)
+		return
+	}
 	if err != nil {
 		lib.ErrorResponse(w, http.StatusInternalServerError, err, errFailedGettingInformationFromIndexer, ctx.Log)
 		return

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -326,7 +326,7 @@ func (p *player) enterPeriod(r routerHandle, source thresholdEvent, target perio
 	p.Step = soft
 	p.Napping = false
 	p.FastRecoveryDeadline = 0 // set immediately
-	p.Deadline = filterTimeout
+	p.Deadline = FilterTimeout(target, source.Proto)
 
 	// update tracer state to match player
 	r.t.setMetadata(tracerMetadata{p.Round, p.Period, p.Step})
@@ -371,7 +371,15 @@ func (p *player) enterRound(r routerHandle, source event, target round) []action
 	p.Step = soft
 	p.Napping = false
 	p.FastRecoveryDeadline = 0 // set immediately
-	p.Deadline = filterTimeout
+
+	switch source := source.(type) {
+	case roundInterruptionEvent:
+		p.Deadline = FilterTimeout(0, source.Proto.Version)
+	case thresholdEvent:
+		p.Deadline = FilterTimeout(0, source.Proto)
+	case filterableMessageEvent:
+		p.Deadline = FilterTimeout(0, source.Proto.Version)
+	}
 
 	// update tracer state to match player
 	r.t.setMetadata(tracerMetadata{p.Round, p.Period, p.Step})
@@ -547,21 +555,29 @@ func (p *player) handleMessageEvent(r routerHandle, e messageEvent) (actions []a
 		case payloadPipelined:
 			ep := ef.(payloadProcessedEvent)
 			if ep.Round == p.Round {
+				up := e.Input.UnauthenticatedProposal
+				uv := ef.(payloadProcessedEvent).Vote.u()
+
+				a := relayAction(e, protocol.ProposalPayloadTag, compoundMessage{Proposal: up, Vote: uv})
+				actions = append(actions, a)
 				return append(actions, verifyPayloadAction(e, ep.Round, ep.Period, ep.Pinned))
 			}
 		}
 
-		var uv unauthenticatedVote
-		switch ef.t() {
-		case payloadPipelined, payloadAccepted:
-			uv = ef.(payloadProcessedEvent).Vote.u()
-		case proposalCommittable:
-			uv = ef.(committableEvent).Vote.u()
-		}
-		up := e.Input.UnauthenticatedProposal
+		// relay as the proposer
+		if e.Input.MessageHandle == nil {
+			var uv unauthenticatedVote
+			switch ef.t() {
+			case payloadPipelined, payloadAccepted:
+				uv = ef.(payloadProcessedEvent).Vote.u()
+			case proposalCommittable:
+				uv = ef.(committableEvent).Vote.u()
+			}
+			up := e.Input.UnauthenticatedProposal
 
-		a := relayAction(e, protocol.ProposalPayloadTag, compoundMessage{Proposal: up, Vote: uv})
-		actions = append(actions, a)
+			a := relayAction(e, protocol.ProposalPayloadTag, compoundMessage{Proposal: up, Vote: uv})
+			actions = append(actions, a)
+		}
 
 		// If the payload is valid, check it against any received cert threshold.
 		// Of course, this should only trigger for payloadVerified case.

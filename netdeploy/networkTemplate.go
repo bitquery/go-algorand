@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -185,9 +185,16 @@ func (t NetworkTemplate) Validate() error {
 		}
 		accounts[upperAcct] = true
 	}
+
 	totalPctInt, _ := totalPct.Int64()
+	const epsilon = 0.0000001
 	if totalPctInt != 100 {
-		return fmt.Errorf("invalid template: Genesis account allocations must total 100 (actual %v)", totalPct)
+		totalPctFloat, _ := totalPct.Float64()
+		if totalPctInt < 100 && totalPctFloat > (100.0-epsilon) {
+			// ignore. This is a rounding error.
+		} else {
+			return fmt.Errorf("invalid template: Genesis account allocations must total 100 (actual %v)", totalPct)
+		}
 	}
 
 	// No wallet can be assigned to more than one node
@@ -213,23 +220,24 @@ func (t NetworkTemplate) Validate() error {
 	return nil
 }
 
-// TODO: Build the JSON object using a real encoder
 func createConfigFile(node remote.NodeConfigGoal, configFile string, numNodes int) error {
+	cfg := config.GetDefaultLocal()
+	cfg.GossipFanout = numNodes
 	// Override default :8080 REST endpoint, and disable SRV lookup
-	configString := `{ "GossipFanout": ` + fmt.Sprintf("%d", numNodes) +
-		`, "EndpointAddress": "127.0.0.1:0", "DNSBootstrapID": "", "EnableProfiler": true`
+	cfg.EndpointAddress = "127.0.0.1:0"
+	cfg.DNSBootstrapID = ""
+	cfg.EnableProfiler = true
+
 	if node.IsRelay {
 		// Have relays listen on any localhost port
-		configString += `, "NetAddress": "127.0.0.1:0"`
+		cfg.NetAddress = "127.0.0.1:0"
 	} else {
 		// Non-relays should not open incoming connections
-		configString += `, "IncomingConnectionsLimit": 0`
+		cfg.IncomingConnectionsLimit = 0
 	}
 
 	if node.DeadlockDetection != 0 {
-		configString += fmt.Sprintf(`, "DeadlockDetection": %d`, node.DeadlockDetection)
+		cfg.DeadlockDetection = node.DeadlockDetection
 	}
-
-	configString += " }"
-	return ioutil.WriteFile(configFile, []byte(configString), os.ModePerm)
+	return cfg.SaveToFile(configFile)
 }

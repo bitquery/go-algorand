@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -18,6 +18,7 @@ package data
 
 import (
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/algorand/go-algorand/agreement"
@@ -28,6 +29,7 @@ import (
 	"github.com/algorand/go-algorand/data/committee"
 	"github.com/algorand/go-algorand/data/transactions"
 	"github.com/algorand/go-algorand/ledger"
+	"github.com/algorand/go-algorand/ledger/ledgercore"
 	"github.com/algorand/go-algorand/logging"
 	"github.com/algorand/go-algorand/protocol"
 )
@@ -43,6 +45,35 @@ type Ledger struct {
 	*ledger.Ledger
 
 	log logging.Logger
+
+	// a two-item moving window cache for the total number of online circulating coins
+	lastRoundCirculation atomic.Value
+	// a two-item moving window cache for the round seed
+	lastRoundSeed atomic.Value
+}
+
+// roundCirculationPair used to hold a pair of matching round number and the amount of online money
+type roundCirculationPair struct {
+	round       basics.Round
+	onlineMoney basics.MicroAlgos
+}
+
+// roundCirculation is the cache for the circulating coins
+type roundCirculation struct {
+	// elements holds several round-onlineMoney pairs
+	elements [2]roundCirculationPair
+}
+
+// roundSeedPair is the cache for a single seed at a given round
+type roundSeedPair struct {
+	round basics.Round
+	seed  committee.Seed
+}
+
+// roundSeed is the cache for the seed
+type roundSeed struct {
+	// elements holds several round-seed pairs
+	elements [2]roundSeedPair
 }
 
 func makeGenesisBlock(proto protocol.ConsensusVersion, genesisBal GenesisBalances, genesisID string, genesisHash crypto.Digest) (bookkeeping.Block, error) {
@@ -72,7 +103,7 @@ func makeGenesisBlock(proto protocol.ConsensusVersion, genesisBal GenesisBalance
 			Round:        0,
 			Branch:       bookkeeping.BlockHash{},
 			Seed:         committee.Seed(genesisHash),
-			TxnRoot:      transactions.Payset{}.CommitGenesis(params.PaysetCommitFlat),
+			TxnRoot:      transactions.Payset{}.CommitGenesis(),
 			TimeStamp:    genesisBal.timestamp,
 			GenesisID:    genesisID,
 			RewardsState: genesisRewardsState,
@@ -188,9 +219,30 @@ func (l *Ledger) NextRound() basics.Round {
 
 // Circulation implements agreement.Ledger.Circulation.
 func (l *Ledger) Circulation(r basics.Round) (basics.MicroAlgos, error) {
+	circulation, cached := l.lastRoundCirculation.Load().(roundCirculation)
+	if cached && r != basics.Round(0) {
+		for _, element := range circulation.elements {
+			if element.round == r {
+				return element.onlineMoney, nil
+			}
+		}
+	}
+
 	totals, err := l.Totals(r)
 	if err != nil {
 		return basics.MicroAlgos{}, err
+	}
+
+	if !cached || r > circulation.elements[1].round {
+		l.lastRoundCirculation.Store(
+			roundCirculation{
+				elements: [2]roundCirculationPair{
+					circulation.elements[1],
+					{
+						round:       r,
+						onlineMoney: totals.Online.Money},
+				},
+			})
 	}
 
 	return totals.Online.Money, nil
@@ -201,10 +253,33 @@ func (l *Ledger) Circulation(r basics.Round) (basics.MicroAlgos, error) {
 // I/O error.
 // Implements agreement.Ledger.Seed
 func (l *Ledger) Seed(r basics.Round) (committee.Seed, error) {
+	seed, cached := l.lastRoundSeed.Load().(roundSeed)
+	if cached && r != basics.Round(0) {
+		for _, roundSeed := range seed.elements {
+			if roundSeed.round == r {
+				return roundSeed.seed, nil
+			}
+		}
+	}
+
 	blockhdr, err := l.BlockHdr(r)
 	if err != nil {
 		return committee.Seed{}, err
 	}
+
+	if !cached || r > seed.elements[1].round {
+		l.lastRoundSeed.Store(
+			roundSeed{
+				elements: [2]roundSeedPair{
+					seed.elements[1],
+					{
+						round: r,
+						seed:  blockhdr.Seed,
+					},
+				},
+			})
+	}
+
 	return blockhdr.Seed, nil
 }
 
@@ -259,7 +334,7 @@ func (l *Ledger) EnsureValidatedBlock(vb *ledger.ValidatedBlock, c agreement.Cer
 		logfn := logging.Base().Errorf
 
 		switch err.(type) {
-		case ledger.BlockInLedgerError:
+		case ledgercore.BlockInLedgerError:
 			logfn = logging.Base().Debugf
 		}
 
@@ -287,7 +362,7 @@ func (l *Ledger) EnsureBlock(block *bookkeeping.Block, c agreement.Certificate) 
 				logging.Base().Errorf("unrecoverable protocol error detected at block %d: %v", round, err)
 				protocolErrorLogged = true
 			}
-		case ledger.BlockInLedgerError:
+		case ledgercore.BlockInLedgerError:
 			logging.Base().Debugf("could not write block %d to the ledger: %v", round, err)
 			return // this error implies that l.LastRound() >= round
 		default:

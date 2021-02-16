@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -27,7 +27,9 @@ import (
 // TestNodeSerialization tests the serialization and deserialization of nodes.
 func TestNodeSerialization(t *testing.T) {
 	var memoryCommitter InMemoryCommitter
-	mt1, _ := MakeTrie(&memoryCommitter, 1000)
+	memConfig := defaultTestMemoryConfig
+	memConfig.CachedNodesCount = 1000
+	mt1, _ := MakeTrie(&memoryCommitter, memConfig)
 	// create 1024 hashes.
 	leafsCount := 1024
 	hashes := make([]crypto.Digest, leafsCount)
@@ -65,7 +67,8 @@ func (n *node) leafUsingChildrenLength() bool {
 func BenchmarkNodeLeafImplementation(b *testing.B) {
 	b.Run("leaf-ChildrenMask", func(b *testing.B) {
 		var memoryCommitter InMemoryCommitter
-		mt1, _ := MakeTrie(&memoryCommitter, defaultTestEvictSize)
+		memConfig := defaultTestMemoryConfig
+		mt1, _ := MakeTrie(&memoryCommitter, memConfig)
 		// create 100000 hashes.
 		leafsCount := 100000
 		hashes := make([]crypto.Digest, leafsCount)
@@ -92,7 +95,8 @@ func BenchmarkNodeLeafImplementation(b *testing.B) {
 	})
 	b.Run("leaf-ChildrenLength", func(b *testing.B) {
 		var memoryCommitter InMemoryCommitter
-		mt1, _ := MakeTrie(&memoryCommitter, defaultTestEvictSize)
+		memConfig := defaultTestMemoryConfig
+		mt1, _ := MakeTrie(&memoryCommitter, memConfig)
 		// create 100000 hashes.
 		leafsCount := 100000
 		hashes := make([]crypto.Digest, leafsCount)

@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -17,8 +17,6 @@
 package upgrades
 
 import (
-	"fmt"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -67,18 +65,7 @@ func makeApplicationUpgradeConsensus(t *testing.T) (appConsensus config.Consensu
 // to a version that supports applications. It verify that prior to supporting applications, the node would not accept
 // any application transaction and after the upgrade is complete, it would support that.
 func TestApplicationsUpgradeOverREST(t *testing.T) {
-	// set the small lambda to 500 for the duration of this test.
-	roundTimeMs := 500
-	lambda := os.Getenv("ALGOSMALLLAMBDAMSEC")
-	os.Setenv("ALGOSMALLLAMBDAMSEC", fmt.Sprintf("%d", roundTimeMs))
-	defer func() {
-		if lambda == "" {
-			os.Unsetenv("ALGOSMALLLAMBDAMSEC")
-		} else {
-			os.Setenv("ALGOSMALLLAMBDAMSEC", lambda)
-		}
-	}()
-
+	smallLambdaMs := 500
 	consensus := makeApplicationUpgradeConsensus(t)
 
 	var fixture fixtures.RestClientFixture
@@ -141,9 +128,9 @@ int 1  // increment
 app_local_put
 int 1
 `
-	approval, err := logic.AssembleString(counter)
+	approvalOps, err := logic.AssembleString(counter)
 	require.NoError(t, err)
-	clearstate, err := logic.AssembleString("#pragma version 2\nint 1")
+	clearstateOps, err := logic.AssembleString("#pragma version 2\nint 1")
 	require.NoError(t, err)
 	schema := basics.StateSchema{
 		NumUint: 1,
@@ -151,7 +138,7 @@ int 1
 
 	// create the app
 	tx, err := client.MakeUnsignedAppCreateTx(
-		transactions.OptInOC, approval, clearstate, schema, schema, nil, nil, nil, nil,
+		transactions.OptInOC, approvalOps.Program, clearstateOps.Program, schema, schema, nil, nil, nil, nil,
 	)
 	require.NoError(t, err)
 	tx, err = client.FillUnsignedTxTemplate(creator, 0, 0, fee, tx)
@@ -177,7 +164,7 @@ int 1
 		require.NoError(t, err)
 
 		require.Less(t, int64(time.Now().Sub(startLoopTime)), int64(3*time.Minute))
-		time.Sleep(time.Duration(roundTimeMs) * time.Millisecond)
+		time.Sleep(time.Duration(smallLambdaMs) * time.Millisecond)
 		round = curStatus.LastRound
 	}
 
@@ -206,8 +193,8 @@ int 1
 		params = p
 		break
 	}
-	require.Equal(t, approval, params.ApprovalProgram)
-	require.Equal(t, clearstate, params.ClearStateProgram)
+	require.Equal(t, approvalOps.Program, params.ApprovalProgram)
+	require.Equal(t, clearstateOps.Program, params.ClearStateProgram)
 	require.Equal(t, schema, params.LocalStateSchema)
 	require.Equal(t, schema, params.GlobalStateSchema)
 	require.Equal(t, 1, len(params.GlobalState))
@@ -244,8 +231,8 @@ int 1
 	require.Equal(t, 1, len(ad.AppParams))
 	params, ok = ad.AppParams[appIdx]
 	require.True(t, ok)
-	require.Equal(t, approval, params.ApprovalProgram)
-	require.Equal(t, clearstate, params.ClearStateProgram)
+	require.Equal(t, approvalOps.Program, params.ApprovalProgram)
+	require.Equal(t, clearstateOps.Program, params.ClearStateProgram)
 	require.Equal(t, schema, params.LocalStateSchema)
 	require.Equal(t, schema, params.GlobalStateSchema)
 	require.Equal(t, 1, len(params.GlobalState))
@@ -291,18 +278,7 @@ int 1
 // to a version that supports applications. It verify that prior to supporting applications, the node would not accept
 // any application transaction and after the upgrade is complete, it would support that.
 func TestApplicationsUpgradeOverGossip(t *testing.T) {
-	// set the small lambda to 500 for the duration of this test.
-	roundTimeMs := 500
-	lambda := os.Getenv("ALGOSMALLLAMBDAMSEC")
-	os.Setenv("ALGOSMALLLAMBDAMSEC", fmt.Sprintf("%d", roundTimeMs))
-	defer func() {
-		if lambda == "" {
-			os.Unsetenv("ALGOSMALLLAMBDAMSEC")
-		} else {
-			os.Setenv("ALGOSMALLLAMBDAMSEC", lambda)
-		}
-	}()
-
+	smallLambdaMs := 500
 	consensus := makeApplicationUpgradeConsensus(t)
 
 	var fixture fixtures.RestClientFixture
@@ -381,9 +357,9 @@ int 1  // increment
 app_local_put
 int 1
 `
-	approval, err := logic.AssembleString(counter)
+	approvalOps, err := logic.AssembleString(counter)
 	require.NoError(t, err)
-	clearstate, err := logic.AssembleString("#pragma version 2\nint 1")
+	clearstateOps, err := logic.AssembleString("#pragma version 2\nint 1")
 	require.NoError(t, err)
 	schema := basics.StateSchema{
 		NumUint: 1,
@@ -391,7 +367,7 @@ int 1
 
 	// create the app
 	tx, err := client.MakeUnsignedAppCreateTx(
-		transactions.OptInOC, approval, clearstate, schema, schema, nil, nil, nil, nil,
+		transactions.OptInOC, approvalOps.Program, clearstateOps.Program, schema, schema, nil, nil, nil, nil,
 	)
 	require.NoError(t, err)
 	tx, err = client.FillUnsignedTxTemplate(creator, round, round+primaryNodeUnupgradedProtocol.DefaultUpgradeWaitRounds, fee, tx)
@@ -436,7 +412,7 @@ int 1
 		require.NoError(t, err)
 
 		require.Less(t, int64(time.Now().Sub(startLoopTime)), int64(3*time.Minute))
-		time.Sleep(time.Duration(roundTimeMs) * time.Millisecond)
+		time.Sleep(time.Duration(smallLambdaMs) * time.Millisecond)
 		round = curStatus.LastRound
 	}
 
@@ -469,8 +445,8 @@ int 1
 		params = p
 		break
 	}
-	require.Equal(t, approval, params.ApprovalProgram)
-	require.Equal(t, clearstate, params.ClearStateProgram)
+	require.Equal(t, approvalOps.Program, params.ApprovalProgram)
+	require.Equal(t, clearstateOps.Program, params.ClearStateProgram)
 	require.Equal(t, schema, params.LocalStateSchema)
 	require.Equal(t, schema, params.GlobalStateSchema)
 	require.Equal(t, 1, len(params.GlobalState))
@@ -507,8 +483,8 @@ int 1
 	require.Equal(t, 1, len(ad.AppParams))
 	params, ok = ad.AppParams[appIdx]
 	require.True(t, ok)
-	require.Equal(t, approval, params.ApprovalProgram)
-	require.Equal(t, clearstate, params.ClearStateProgram)
+	require.Equal(t, approvalOps.Program, params.ApprovalProgram)
+	require.Equal(t, clearstateOps.Program, params.ClearStateProgram)
 	require.Equal(t, schema, params.LocalStateSchema)
 	require.Equal(t, schema, params.GlobalStateSchema)
 	require.Equal(t, 1, len(params.GlobalState))

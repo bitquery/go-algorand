@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -17,8 +17,8 @@
 package main
 
 import (
+	"fmt"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -65,6 +65,10 @@ func (d *testDbgAdapter) SessionEnded(sid string) {
 	d.ended = true
 }
 
+func (d *testDbgAdapter) URL() string {
+	return ""
+}
+
 func (d *testDbgAdapter) eventLoop() {
 	for {
 		select {
@@ -81,8 +85,6 @@ func (d *testDbgAdapter) eventLoop() {
 				require.NotEmpty(d.t, n.DebugState.ExecID)
 				d.debugger.SetBreakpoint(n.DebugState.Line + 1)
 			}
-			// simulate user delay to workaround race cond
-			time.Sleep(10 * time.Millisecond)
 			d.debugger.Resume()
 		}
 	}
@@ -106,10 +108,10 @@ func TestDebuggerSimple(t *testing.T) {
 int 1
 +
 `
-	program, err := logic.AssembleStringV1(source)
+	ops, err := logic.AssembleStringWithVersion(source, 1)
 	require.NoError(t, err)
 
-	_, err = logic.Eval(program, ep)
+	_, err = logic.Eval(ops.Program, ep)
 	require.NoError(t, err)
 
 	da.WaitForCompletion()
@@ -117,4 +119,68 @@ int 1
 	require.True(t, da.started)
 	require.True(t, da.ended)
 	require.Equal(t, 3, da.eventCount) // register, update, complete
+}
+
+func TestSession(t *testing.T) {
+	source := fmt.Sprintf("#pragma version %d\nint 1\ndup\n+\n", logic.LogicVersion)
+	ops, err := logic.AssembleStringWithVersion(source, logic.LogicVersion)
+	require.NoError(t, err)
+	disassembly, err := logic.Disassemble(ops.Program)
+	require.NoError(t, err)
+
+	// create a sample disassembly line to pc mapping
+	// this simple source is similar to disassembly except intcblock at the begining
+	pcOffset := make(map[int]int, len(ops.OffsetToLine))
+	for pc, line := range ops.OffsetToLine {
+		pcOffset[line+1] = pc
+	}
+
+	s := makeSession(disassembly, 0)
+	s.source = source
+	s.programName = "test"
+	s.offsetToLine = ops.OffsetToLine
+	s.pcOffset = pcOffset
+	err = s.SetBreakpoint(2)
+	require.NoError(t, err)
+
+	ackCount := 0
+	done := make(chan struct{})
+	ackFunc := func() {
+		<-s.acknowledged
+		ackCount++
+		done <- struct{}{}
+	}
+	go ackFunc()
+
+	s.Resume()
+	<-done
+
+	require.Equal(t, breakpointLine(2), s.debugConfig.BreakAtLine)
+	require.Equal(t, breakpoint{true, true}, s.breakpoints[2])
+	require.Equal(t, 1, ackCount)
+
+	s.SetBreakpointsActive(false)
+	require.Equal(t, breakpoint{true, false}, s.breakpoints[2])
+
+	s.SetBreakpointsActive(true)
+	require.Equal(t, breakpoint{true, true}, s.breakpoints[2])
+
+	s.RemoveBreakpoint(2)
+	require.Equal(t, breakpoint{false, false}, s.breakpoints[2])
+
+	go ackFunc()
+
+	s.Step()
+	<-done
+
+	require.Equal(t, stepBreak, s.debugConfig.BreakAtLine)
+	require.Equal(t, 2, ackCount)
+
+	data, err := s.GetSourceMap()
+	require.NoError(t, err)
+	require.Greater(t, len(data), 0)
+
+	name, data := s.GetSource()
+	require.NotEmpty(t, name)
+	require.Greater(t, len(data), 0)
 }
