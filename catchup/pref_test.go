@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -60,7 +60,7 @@ func BenchmarkServiceFetchBlocks(b *testing.B) {
 		syncer.fetcherFactory = makeMockFactory(&MockedFetcher{ledger: remote, timeout: false, tries: make(map[basics.Round]int), latency: 100 * time.Millisecond, predictable: true})
 
 		b.StartTimer()
-		syncer.sync(nil)
+		syncer.sync()
 		b.StopTimer()
 		local.Close()
 		require.Equal(b, remote.LastRound(), local.LastRound())

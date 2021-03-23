@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -306,4 +306,19 @@ type Message struct {
 // client to monitor the activity of the various events queues.
 type EventsProcessingMonitor interface {
 	UpdateEventsQueue(queueName string, queueLength int)
+}
+
+// LedgerDroppedRoundError is a wrapper error for when the ledger cannot return a Lookup query because
+// the entry is old and was dropped from the ledger. The purpose of this wrapper is to help the
+// agreement differentiate between a malicious vote and a vote that it cannot verify
+type LedgerDroppedRoundError struct {
+	Err error
+}
+
+func (e *LedgerDroppedRoundError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *LedgerDroppedRoundError) Unwrap() error {
+	return e.Err
 }

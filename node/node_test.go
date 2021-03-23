@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -42,7 +42,7 @@ import (
 	"github.com/algorand/go-algorand/util/execpool"
 )
 
-var expectedAgreementTime = 2*config.Protocol.BigLambda + 3*config.Protocol.SmallLambda + 2*time.Second
+var expectedAgreementTime = 2*config.Protocol.BigLambda + config.Protocol.SmallLambda + config.Consensus[protocol.ConsensusCurrentVersion].AgreementFilterTimeout + 2*time.Second
 
 var sinkAddr = basics.Address{0x7, 0xda, 0xcb, 0x4b, 0x6d, 0x9e, 0xd1, 0x41, 0xb1, 0x75, 0x76, 0xbd, 0x45, 0x9a, 0xe6, 0x42, 0x1d, 0x48, 0x6d, 0xa3, 0xd4, 0xef, 0x22, 0x47, 0xc4, 0x9, 0xa3, 0x96, 0xb8, 0x2e, 0xa2, 0x21}
 var poolAddr = basics.Address{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
@@ -458,4 +458,41 @@ func TestStatusReport_TimeSinceLastRound(t *testing.T) {
 			}
 		})
 	}
+}
+
+type mismatchingDirectroyPermissionsLog struct {
+	logging.Logger
+	t *testing.T
+}
+
+func (m mismatchingDirectroyPermissionsLog) Errorf(fmts string, args ...interface{}) {
+	fmtStr := fmt.Sprintf(fmts, args...)
+	require.Contains(m.t, fmtStr, "Unable to create genesis directroy")
+}
+
+// TestMismatchingGenesisDirectoryPermissions tests to see that the os.MkDir check we have in MakeFull works as expected. It tests both the return error as well as the logged error.
+func TestMismatchingGenesisDirectoryPermissions(t *testing.T) {
+	testDirectroy, err := ioutil.TempDir(os.TempDir(), t.Name())
+	require.NoError(t, err)
+
+	genesis := bookkeeping.Genesis{
+		SchemaID:    "go-test-node-genesis",
+		Proto:       protocol.ConsensusCurrentVersion,
+		Network:     config.Devtestnet,
+		FeeSink:     sinkAddr.String(),
+		RewardsPool: poolAddr.String(),
+	}
+
+	log := mismatchingDirectroyPermissionsLog{logging.TestingLog(t), t}
+
+	require.NoError(t, os.Chmod(testDirectroy, 0200))
+
+	node, err := MakeFull(log, testDirectroy, config.GetDefaultLocal(), []string{}, genesis)
+
+	require.Nil(t, node)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "permission denied")
+
+	require.NoError(t, os.Chmod(testDirectroy, 1700))
+	require.NoError(t, os.RemoveAll(testDirectroy))
 }

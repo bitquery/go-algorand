@@ -46,17 +46,22 @@ mule-deploy-%: PKG_TYPE=$*
 mule-deploy-%:
 	scripts/release/mule/deploy/$(PKG_TYPE)/deploy.sh
 
-mule-package-deb: ci-build
+mule-docker:
+	scripts/release/mule/deploy/docker/docker.sh
+
 mule-package-%: PKG_TYPE=$*
 mule-package-%:
 	echo Building algorand package...
-	scripts/release/mule/package/$(PKG_TYPE)/package.sh
+	scripts/release/mule/package/$(PKG_TYPE)/package.sh algorand
 	echo Building algorand-devtools package...
 	scripts/release/mule/package/$(PKG_TYPE)/package.sh algorand-devtools
 
-mule-sign-%: PKG_TYPE=$*
-mule-sign-%:
-	scripts/release/mule/sign/sign.sh $(PKG_TYPE)
+mule-releases-page:
+	echo Generating the releases page...
+	scripts/release/mule/deploy/releases_page/generate_releases_page.sh
+
+mule-sign:
+	scripts/release/mule/sign/sign.sh
 
 mule-test-%: PKG_TYPE=$*
 mule-test-%:

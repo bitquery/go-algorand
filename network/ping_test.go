@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -60,7 +60,7 @@ func TestPing(t *testing.T) {
 		if lastPingRoundTripTime > 0 {
 			postPing := time.Now()
 			testTime := postPing.Sub(prePing)
-			if (lastPingRoundTripTime < testTime) {
+			if lastPingRoundTripTime < testTime {
 				// success
 				return
 			}

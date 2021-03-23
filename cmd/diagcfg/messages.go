@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -21,11 +21,11 @@ const (
 	loggingNotEnabled    = "Remote logging is currently disabled"
 	loggingEnabled       = "Remote logging is enabled.  Node = %s, Guid = %s\n"
 
-	metricNoConfig                          = "Unable to load configuration file : %s\n"
-	metricConfigReadingFailed               = "Failed to read configuration file : %s\n"
-	metricReportingStatus                   = "Metric reporting is %s\n"
-	metricSaveConfigFailed                  = "Metric configuration file could not be saved : %s\n"
-	metricDataDirectoryEmpty                = "no data directory was specified. Please use either -d or set environment variable ALGORAND_DATA"
+	metricNoConfig            = "Unable to load configuration file : %s\n"
+	metricConfigReadingFailed = "Failed to read configuration file : %s\n"
+	metricReportingStatus     = "Metric reporting is %s\n"
+	metricSaveConfigFailed    = "Metric configuration file could not be saved : %s\n"
+	metricDataDirectoryEmpty  = "no data directory was specified. Please use either -d or set environment variable ALGORAND_DATA"
 
 	telemetryConfigReadError = "Could not read telemetry config: %s\n"
 

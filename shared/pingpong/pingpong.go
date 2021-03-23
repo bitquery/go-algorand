@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -31,8 +31,15 @@ import (
 	"github.com/algorand/go-algorand/libgoal"
 )
 
+// CreatablesInfo has information about created assets, apps and opting in
+type CreatablesInfo struct {
+	AssetParams map[uint64]v1.AssetParams
+	AppParams   map[uint64]v1.AppParams
+	OptIns      map[uint64][]string
+}
+
 // PrepareAccounts to set up accounts and asset accounts required for Ping Pong run
-func PrepareAccounts(ac libgoal.Client, initCfg PpConfig) (accounts map[string]uint64, assetParams map[uint64]v1.AssetParams, appParams map[uint64]v1.AppParams, cfg PpConfig, err error) {
+func PrepareAccounts(ac libgoal.Client, initCfg PpConfig) (accounts map[string]uint64, cinfo CreatablesInfo, cfg PpConfig, err error) {
 	cfg = initCfg
 	accounts, cfg, err = ensureAccounts(ac, cfg)
 	if err != nil {
@@ -40,61 +47,77 @@ func PrepareAccounts(ac libgoal.Client, initCfg PpConfig) (accounts map[string]u
 		return
 	}
 
+	wallet, walletErr := ac.GetUnencryptedWalletHandle()
+	if err != nil {
+		_, _ = fmt.Fprintf(os.Stderr, "unable to access wallet %v\n", walletErr)
+		err = walletErr
+		return
+	}
 	if cfg.NumAsset > 0 {
 		// zero out max amount for asset transactions
 		cfg.MaxAmt = 0
 
-		wallet, walletErr := ac.GetUnencryptedWalletHandle()
+		var assetAccounts map[string]uint64
+		assetAccounts, err = prepareNewAccounts(ac, cfg, wallet, accounts)
 		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "unable to access wallet %v\n", walletErr)
-			err = walletErr
-			return
-		}
-		fmt.Printf("Generating %v new accounts for asset transfer test\n", cfg.NumPartAccounts)
-		// remove existing accounts except for src account
-		for k := range accounts {
-			if k != cfg.SrcAccount {
-				delete(accounts, k)
-			}
-		}
-		// create new accounts for asset testing
-		assetAccounts := make(map[string]uint64)
-		assetAccounts, err = generateAccounts(ac, assetAccounts, cfg.NumPartAccounts-1, wallet)
-
-		for addr := range assetAccounts {
-			fmt.Printf("generated account %v\n", addr)
-		}
-
-		for k := range assetAccounts {
-			accounts[k] = assetAccounts[k]
-		}
-		err = fundAccounts(accounts, ac, cfg)
-		if err != nil {
-			_, _ = fmt.Fprintf(os.Stderr, "fund accounts failed %v\n", err)
+			_, _ = fmt.Fprintf(os.Stderr, "prepare new accounts failed: %v\n", err)
 			return
 		}
 
-		assetParams, err = prepareAssets(assetAccounts, ac, cfg)
+		cinfo.AssetParams, cinfo.OptIns, err = prepareAssets(assetAccounts, ac, cfg)
 		if err != nil {
 			_, _ = fmt.Fprintf(os.Stderr, "prepare assets failed %v\n", err)
 			return
 		}
 
-		for k := range assetAccounts {
-			accounts[k] = assetAccounts[k]
+		if !cfg.Quiet {
+			for addr := range accounts {
+				fmt.Printf("final prepareAccounts, account addr: %s, balance: %d\n", addr, accounts[addr])
+			}
 		}
 	} else if cfg.NumApp > 0 {
-		appParams, err = prepareApps(accounts, ac, cfg)
+
+		var appAccounts map[string]uint64
+		appAccounts, err = prepareNewAccounts(ac, cfg, wallet, accounts)
 		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "prepare new accounts failed: %v\n", err)
+			return
+		}
+		cinfo.AppParams, cinfo.OptIns, err = prepareApps(appAccounts, ac, cfg)
+		if err != nil {
+			return
+		}
+		if !cfg.Quiet {
+			for addr := range accounts {
+				fmt.Printf("final prepareAccounts, account addr: %s, balance: %d\n", addr, accounts[addr])
+			}
+		}
+	} else {
+		err = fundAccounts(accounts, ac, cfg)
+		if err != nil {
+			_, _ = fmt.Fprintf(os.Stderr, "fund accounts failed %v\n", err)
 			return
 		}
 	}
 
-	for addr := range accounts {
-		fmt.Printf("**** participant account %v\n", addr)
-	}
+	return
+}
 
-	err = fundAccounts(accounts, ac, cfg)
+func prepareNewAccounts(client libgoal.Client, cfg PpConfig, wallet []byte, accounts map[string]uint64) (newAccounts map[string]uint64, err error) {
+	// remove existing accounts except for src account
+	for k := range accounts {
+		if k != cfg.SrcAccount {
+			delete(accounts, k)
+		}
+	}
+	// create new accounts for testing
+	newAccounts = make(map[string]uint64)
+	newAccounts, err = generateAccounts(client, newAccounts, cfg.NumPartAccounts-1, wallet)
+
+	for k := range newAccounts {
+		accounts[k] = newAccounts[k]
+	}
+	err = fundAccounts(accounts, client, cfg)
 	if err != nil {
 		_, _ = fmt.Fprintf(os.Stderr, "fund accounts failed %v\n", err)
 		return
@@ -104,15 +127,31 @@ func PrepareAccounts(ac libgoal.Client, initCfg PpConfig) (accounts map[string]u
 }
 
 // determine the min balance per participant account
-func computeAccountMinBalance(cfg PpConfig) (requiredBalance uint64) {
-	const minActiveAccountBalance uint64 = 100000 // min balance for any active account
+func computeAccountMinBalance(client libgoal.Client, cfg PpConfig) (requiredBalance uint64, err error) {
+	proto, err := getProto(client)
+	if err != nil {
+		return
+	}
 
+	minActiveAccountBalance := proto.MinBalance
+
+	if cfg.NumApp > 0 {
+		requiredBalance = (cfg.MinAccountFunds + (cfg.MaxAmt+cfg.MaxFee)*10) * 2
+		fmt.Printf("required min balance for app accounts: %d\n", requiredBalance)
+		return
+	}
 	var fee uint64 = 1000
 	if cfg.MinFee > fee {
 		fee = cfg.MinFee
 	}
 	if cfg.MaxFee != 0 {
 		fee = cfg.MaxFee
+	} else {
+		// follow the same logic as constructTxn
+		fee, err = client.SuggestedFee()
+		if err != nil {
+			return
+		}
 	}
 	requiredBalance = minActiveAccountBalance
 
@@ -123,6 +162,15 @@ func computeAccountMinBalance(cfg PpConfig) (requiredBalance uint64) {
 			(fee)*uint64(cfg.NumAsset)*uint64(cfg.NumPartAccounts) + // asset opt-ins
 			(fee)*uint64(cfg.NumAsset)*uint64(cfg.NumPartAccounts) // asset distributions
 		requiredBalance += assetCost
+	}
+	if cfg.NumApp > 0 {
+		creationCost := uint64(cfg.NumApp) * proto.AppFlatParamsMinBalance * uint64(proto.MaxAppsCreated)
+		optInCost := uint64(cfg.NumApp) * proto.AppFlatOptInMinBalance * uint64(proto.MaxAppsOptedIn)
+		maxGlobalSchema := basics.StateSchema{NumUint: proto.MaxGlobalSchemaEntries, NumByteSlice: proto.MaxGlobalSchemaEntries}
+		maxLocalSchema := basics.StateSchema{NumUint: proto.MaxLocalSchemaEntries, NumByteSlice: proto.MaxLocalSchemaEntries}
+		schemaCost := uint64(cfg.NumApp) * (maxGlobalSchema.MinBalance(&proto).Raw*uint64(proto.MaxAppsCreated) +
+			maxLocalSchema.MinBalance(&proto).Raw*uint64(proto.MaxAppsOptedIn))
+		requiredBalance += creationCost + optInCost + schemaCost
 	}
 	// add cost of transactions
 	requiredBalance += (cfg.MaxAmt + fee) * 2 * cfg.TxnPerSec * uint64(math.Ceil(cfg.RefreshTime.Seconds()))
@@ -144,28 +192,51 @@ func fundAccounts(accounts map[string]uint64, client libgoal.Client, cfg PpConfi
 	// Fee of 0 will make cause the function to use the suggested one by network
 	fee := uint64(0)
 
-	minFund := computeAccountMinBalance(cfg)
+	minFund, err := computeAccountMinBalance(client, cfg)
+	if err != nil {
+		return err
+	}
 
 	fmt.Printf("adjusting account balance to %d\n", minFund)
 	for addr, balance := range accounts {
-		fmt.Printf("adjusting balance of account %v\n", addr)
+		if !cfg.Quiet {
+			fmt.Printf("adjusting balance of account %v\n", addr)
+		}
 		if balance < minFund {
 			toSend := minFund - balance
 			if srcFunds <= toSend {
 				return fmt.Errorf("source account %s has insufficient funds %d - needs %d", cfg.SrcAccount, srcFunds, toSend)
 			}
 			srcFunds -= toSend
-			_, err := client.SendPaymentFromUnencryptedWallet(cfg.SrcAccount, addr, fee, toSend, nil)
+			if !cfg.Quiet {
+				fmt.Printf("adjusting balance of account %v by %d\n ", addr, toSend)
+			}
+			_, err := sendPaymentFromUnencryptedWallet(client, cfg.SrcAccount, addr, fee, toSend, nil)
 			if err != nil {
 				return err
 			}
 			accounts[addr] = minFund
+			if !cfg.Quiet {
+				fmt.Printf("account balance for key %s is %d\n", addr, accounts[addr])
+			}
 
 			totalSent++
 			throttleTransactionRate(startTime, cfg, totalSent)
 		}
 	}
 	return nil
+}
+
+func sendPaymentFromUnencryptedWallet(client libgoal.Client, from, to string, fee, amount uint64, note []byte) (transactions.Transaction, error) {
+	wh, err := client.GetUnencryptedWalletHandle()
+	if err != nil {
+		return transactions.Transaction{}, err
+	}
+	// generate a random lease to avoid duplicate transaction failures
+	var lease [32]byte
+	crypto.RandBytes(lease[:])
+
+	return client.SendPaymentFromWalletWithLease(wh, nil, from, to, fee, amount, note, "", lease, 0, 0)
 }
 
 func refreshAccounts(accounts map[string]uint64, client libgoal.Client, cfg PpConfig) error {
@@ -198,7 +269,7 @@ func listSufficientAccounts(accounts map[string]uint64, minimumAmount uint64, ex
 }
 
 // RunPingPong starts ping pong process
-func RunPingPong(ctx context.Context, ac libgoal.Client, accounts map[string]uint64, assetParam map[uint64]v1.AssetParams, appParam map[uint64]v1.AppParams, cfg PpConfig) {
+func RunPingPong(ctx context.Context, ac libgoal.Client, accounts map[string]uint64, cinfo CreatablesInfo, cfg PpConfig) {
 	// Infinite loop given:
 	//  - accounts -> map of accounts to include in transfers (including src account, which we don't want to use)
 	//  - cfg      -> configuration for how to proceed
@@ -221,6 +292,10 @@ func RunPingPong(ctx context.Context, ac libgoal.Client, accounts map[string]uin
 	} else {
 		runTime = 10000 * time.Hour // Effectively 'forever'
 	}
+	var endTime time.Time
+	if cfg.MaxRuntime > 0 {
+		endTime = time.Now().Add(cfg.MaxRuntime)
+	}
 	restTime := cfg.RestTime
 	refreshTime := time.Now().Add(cfg.RefreshTime)
 
@@ -234,6 +309,11 @@ func RunPingPong(ctx context.Context, ac libgoal.Client, accounts map[string]uin
 
 		var totalSent, totalSucceeded uint64
 		for !time.Now().After(stopTime) {
+			if cfg.MaxRuntime > 0 && time.Now().After(endTime) {
+				fmt.Printf("Terminating after max run time of %.f seconds\n", cfg.MaxRuntime.Seconds())
+				return
+			}
+
 			minimumAmount := cfg.MinAccountFunds + (cfg.MaxAmt+cfg.MaxFee)*2
 			fromList := listSufficientAccounts(accounts, minimumAmount, cfg.SrcAccount)
 			// in group tests txns are sent back and forth, so both parties need funds
@@ -242,7 +322,7 @@ func RunPingPong(ctx context.Context, ac libgoal.Client, accounts map[string]uin
 			}
 			toList := listSufficientAccounts(accounts, minimumAmount, cfg.SrcAccount)
 
-			sent, succeeded, err := sendFromTo(fromList, toList, accounts, assetParam, appParam, ac, cfg)
+			sent, succeeded, err := sendFromTo(fromList, toList, accounts, cinfo, ac, cfg)
 			totalSent += sent
 			totalSucceeded += succeeded
 			if err != nil {
@@ -270,11 +350,11 @@ func RunPingPong(ctx context.Context, ac libgoal.Client, accounts map[string]uin
 	}
 }
 
-func getCreatableID(cfg PpConfig, assetParams map[uint64]v1.AssetParams, appParams map[uint64]v1.AppParams) (aidx uint64) {
+func getCreatableID(cfg PpConfig, cinfo CreatablesInfo) (aidx uint64) {
 	if cfg.NumAsset > 0 {
-		rindex := rand.Intn(len(assetParams))
+		rindex := rand.Intn(len(cinfo.AssetParams))
 		i := 0
-		for k := range assetParams {
+		for k := range cinfo.AssetParams {
 			if i == rindex {
 				aidx = k
 				break
@@ -282,9 +362,9 @@ func getCreatableID(cfg PpConfig, assetParams map[uint64]v1.AssetParams, appPara
 			i++
 		}
 	} else if cfg.NumApp > 0 {
-		rindex := rand.Intn(len(appParams))
+		rindex := rand.Intn(len(cinfo.AppParams))
 		i := 0
-		for k := range appParams {
+		for k := range cinfo.AppParams {
 			if i == rindex {
 				aidx = k
 				break
@@ -297,13 +377,18 @@ func getCreatableID(cfg PpConfig, assetParams map[uint64]v1.AssetParams, appPara
 
 func sendFromTo(
 	fromList, toList []string, accounts map[string]uint64,
-	assetParams map[uint64]v1.AssetParams, appParams map[uint64]v1.AppParams,
+	cinfo CreatablesInfo,
 	client libgoal.Client, cfg PpConfig,
 ) (sentCount, successCount uint64, err error) {
 
 	amt := cfg.MaxAmt
 	fee := cfg.MaxFee
 
+	assetsByCreator := make(map[string][]*v1.AssetParams)
+	for _, p := range cinfo.AssetParams {
+		c := p.Creator
+		assetsByCreator[c] = append(assetsByCreator[c], &p)
+	}
 	for i, from := range fromList {
 		if cfg.RandomizeAmt {
 			amt = rand.Uint64()%cfg.MaxAmt + 1
@@ -330,9 +415,9 @@ func sendFromTo(
 
 		if cfg.GroupSize == 1 {
 			// generate random assetID or appId if we send asset/app txns
-			aidx := getCreatableID(cfg, assetParams, appParams)
+			aidx := getCreatableID(cfg, cinfo)
 			// Construct single txn
-			txn, consErr := constructTxn(from, to, fee, amt, aidx, client, cfg)
+			txn, consErr := constructTxn(from, to, fee, amt, aidx, cinfo, client, cfg)
 			if consErr != nil {
 				err = consErr
 				_, _ = fmt.Fprintf(os.Stderr, "constructTxn failed: %v\n", err)
@@ -358,6 +443,9 @@ func sendFromTo(
 
 			sentCount++
 			_, sendErr = client.BroadcastTransaction(stxn)
+			if sendErr != nil {
+				fmt.Printf("Warning, cannot broadcast txn, %s\n", sendErr)
+			}
 		} else {
 			// Generate txn group
 
@@ -372,17 +460,17 @@ func sendFromTo(
 				var txn transactions.Transaction
 				var signer string
 				if j%2 == 0 {
-					txn, err = constructTxn(from, to, fee, amt, 0, client, cfg)
+					txn, err = constructTxn(from, to, fee, amt, 0, cinfo, client, cfg)
 					fromBalanceChange -= int64(txn.Fee.Raw + amt)
 					toBalanceChange += int64(amt)
 					signer = from
 				} else if cfg.GroupSize == 2 && cfg.Rekey {
-					txn, err = constructTxn(from, to, fee, amt, 0, client, cfg)
+					txn, err = constructTxn(from, to, fee, amt, 0, cinfo, client, cfg)
 					fromBalanceChange -= int64(txn.Fee.Raw + amt)
 					toBalanceChange += int64(amt)
 					signer = to
 				} else {
-					txn, err = constructTxn(to, from, fee, amt, 0, client, cfg)
+					txn, err = constructTxn(to, from, fee, amt, 0, cinfo, client, cfg)
 					toBalanceChange -= int64(txn.Fee.Raw + amt)
 					fromBalanceChange += int64(amt)
 					signer = to
@@ -465,7 +553,7 @@ func sendFromTo(
 	return
 }
 
-func constructTxn(from, to string, fee, amt, aidx uint64, client libgoal.Client, cfg PpConfig) (txn transactions.Transaction, err error) {
+func constructTxn(from, to string, fee, amt, aidx uint64, cinfo CreatablesInfo, client libgoal.Client, cfg PpConfig) (txn transactions.Transaction, err error) {
 	var noteField []byte
 	const pingpongTag = "pingpong"
 	const tagLen = uint32(len(pingpongTag))
@@ -487,7 +575,20 @@ func constructTxn(from, to string, fee, amt, aidx uint64, client libgoal.Client,
 	}
 
 	if cfg.NumApp > 0 { // Construct app transaction
-		txn, err = client.MakeUnsignedAppNoOpTx(aidx, nil, nil, nil, nil)
+		// select opted-in accounts for Txn.Accounts field
+		var accounts []string
+		if len(cinfo.OptIns[aidx]) > 0 {
+			indices := rand.Perm(len(cinfo.OptIns[aidx]))
+			limit := 4
+			if len(indices) < limit {
+				limit = len(indices)
+			}
+			for i := 0; i < limit; i++ {
+				idx := indices[i]
+				accounts = append(accounts, cinfo.OptIns[aidx][idx])
+			}
+		}
+		txn, err = client.MakeUnsignedAppNoOpTx(aidx, nil, accounts, nil, nil)
 		if err != nil {
 			return
 		}
@@ -498,6 +599,13 @@ func constructTxn(from, to string, fee, amt, aidx uint64, client libgoal.Client,
 			_, _ = fmt.Fprintf(os.Stdout, "Calling app %d : %s\n", aidx, from)
 		}
 	} else if cfg.NumAsset > 0 { // Construct asset transaction
+		// select a pair of random opted-in accounts by aidx
+		// use them as from/to addresses
+		if len(cinfo.OptIns[aidx]) > 0 {
+			indices := rand.Perm(len(cinfo.OptIns[aidx]))
+			from = cinfo.OptIns[aidx][indices[0]]
+			to = cinfo.OptIns[aidx][indices[1]]
+		}
 		txn, err = client.MakeUnsignedAssetSendTx(aidx, amt, to, "", "")
 		if err != nil {
 			_, _ = fmt.Fprintf(os.Stdout, "error making unsigned asset send tx %v\n", err)

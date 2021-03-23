@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -31,6 +31,19 @@ type TransactionInLedgerError struct {
 // Error satisfies builtin interface `error`
 func (tile TransactionInLedgerError) Error() string {
 	return fmt.Sprintf("transaction already in ledger: %v", tile.Txid)
+}
+
+// LeaseInLedgerError is returned when a transaction cannot be added because it has a lease that already being used in the relavant rounds
+type LeaseInLedgerError struct {
+	txid  transactions.Txid
+	lease txlease
+}
+
+// Error implements the error interface for the LeaseInLedgerError stuct
+func (lile *LeaseInLedgerError) Error() string {
+	// format the lease as address.
+	addr := basics.Address(lile.lease.lease)
+	return fmt.Sprintf("transaction %v using an overlapping lease %s", lile.txid, addr.String())
 }
 
 // BlockInLedgerError is returned when a block cannot be added because it has already been done

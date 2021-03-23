@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -17,9 +17,11 @@
 package logic
 
 import (
+	"encoding/base64"
 	"os"
 	"testing"
 
+	"github.com/algorand/go-algorand/data/basics"
 	"github.com/stretchr/testify/require"
 )
 
@@ -77,12 +79,12 @@ func TestWebDebuggerManual(t *testing.T) {
 		txn.Txn.Note,
 	}
 
-	program, err := AssembleString(testProgram)
+	ops, err := AssembleString(testProgram)
 	require.NoError(t, err)
 	ep := defaultEvalParams(nil, &txn)
 	ep.TxnGroup = txgroup
 	ep.Debugger = &WebDebuggerHook{URL: debugURL}
-	_, err = Eval(program, ep)
+	_, err = Eval(ops.Program, ep)
 	require.NoError(t, err)
 }
 
@@ -113,15 +115,63 @@ func (d *testDbgHook) Complete(state *DebugState) error {
 
 func TestDebuggerHook(t *testing.T) {
 	testDbg := testDbgHook{}
-	program, err := AssembleString(testProgram)
+	ops, err := AssembleString(testProgram)
 	require.NoError(t, err)
 	ep := defaultEvalParams(nil, nil)
 	ep.Debugger = &testDbg
-	_, err = Eval(program, ep)
+	_, err = Eval(ops.Program, ep)
 	require.NoError(t, err)
 
 	require.Equal(t, 1, testDbg.register)
 	require.Equal(t, 1, testDbg.complete)
 	require.Greater(t, testDbg.update, 1)
 	require.Equal(t, 1, len(testDbg.state.Stack))
+}
+
+func TestLineToPC(t *testing.T) {
+	dState := DebugState{
+		Disassembly: "abc\ndef\nghi",
+		PCOffset:    []PCOffset{{PC: 1, Offset: 4}, {PC: 2, Offset: 8}, {PC: 3, Offset: 12}},
+	}
+	pc := dState.LineToPC(0)
+	require.Equal(t, 0, pc)
+
+	pc = dState.LineToPC(1)
+	require.Equal(t, 1, pc)
+
+	pc = dState.LineToPC(2)
+	require.Equal(t, 2, pc)
+
+	pc = dState.LineToPC(3)
+	require.Equal(t, 3, pc)
+
+	pc = dState.LineToPC(4)
+	require.Equal(t, 0, pc)
+
+	pc = dState.LineToPC(-1)
+	require.Equal(t, 0, pc)
+
+	pc = dState.LineToPC(0x7fffffff)
+	require.Equal(t, 0, pc)
+
+	dState.PCOffset = []PCOffset{}
+	pc = dState.LineToPC(1)
+	require.Equal(t, 0, pc)
+
+	dState.PCOffset = []PCOffset{{PC: 1, Offset: 0}}
+	pc = dState.LineToPC(1)
+	require.Equal(t, 0, pc)
+}
+
+func TestValueDeltaToValueDelta(t *testing.T) {
+	vDelta := basics.ValueDelta{
+		Action: basics.SetUintAction,
+		Bytes:  "some string",
+		Uint:   uint64(0xffffffff),
+	}
+	ans := valueDeltaToValueDelta(&vDelta)
+	require.Equal(t, vDelta.Action, ans.Action)
+	require.NotEqual(t, vDelta.Bytes, ans.Bytes)
+	require.Equal(t, base64.StdEncoding.EncodeToString([]byte(vDelta.Bytes)), ans.Bytes)
+	require.Equal(t, vDelta.Uint, ans.Uint)
 }

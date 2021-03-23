@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -19,5 +19,6 @@ package remote
 // HostConfig represents the configuration of a single deployed Host
 type HostConfig struct {
 	Name  string
+	Group string
 	Nodes []NodeConfig
 }

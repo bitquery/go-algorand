@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -87,6 +87,10 @@ func (wl *wrappedLedger) trackerLog() logging.Logger {
 
 func (wl *wrappedLedger) GenesisHash() crypto.Digest {
 	return wl.l.GenesisHash()
+}
+
+func (wl *wrappedLedger) GenesisProto() config.ConsensusParams {
+	return wl.l.GenesisProto()
 }
 
 func getInitState() (genesisInitState InitState) {
@@ -297,12 +301,12 @@ func makeUnsignedApplicationCallTx(appIdx uint64, onCompletion transactions.OnCo
 
 			int 1
 		`
-		prog, err := logic.AssembleString(testprog)
+		ops, err := logic.AssembleString(testprog)
 		if err != nil {
 			return tx, err
 		}
-		tx.ApprovalProgram = prog
-		tx.ClearStateProgram = prog
+		tx.ApprovalProgram = ops.Program
+		tx.ClearStateProgram = ops.Program
 		tx.GlobalStateSchema = basics.StateSchema{
 			NumByteSlice: 1,
 		}

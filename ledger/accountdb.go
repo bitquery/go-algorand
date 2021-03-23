@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -87,6 +87,18 @@ var creatablesMigration = []string{
 	`ALTER TABLE assetcreators ADD COLUMN ctype INTEGER DEFAULT 0`,
 }
 
+func createNormalizedOnlineBalanceIndex(idxname string, tablename string) string {
+	return fmt.Sprintf(`CREATE INDEX IF NOT EXISTS %s
+		ON %s ( normalizedonlinebalance, address, data )
+		WHERE normalizedonlinebalance>0`, idxname, tablename)
+}
+
+var createOnlineAccountIndex = []string{
+	`ALTER TABLE accountbase
+		ADD COLUMN normalizedonlinebalance INTEGER`,
+	createNormalizedOnlineBalanceIndex("onlineaccountbals", "accountbase"),
+}
+
 var accountsResetExprs = []string{
 	`DROP TABLE IF EXISTS acctrounds`,
 	`DROP TABLE IF EXISTS accounttotals`,
@@ -100,14 +112,22 @@ var accountsResetExprs = []string{
 // accountDBVersion is the database version that this binary would know how to support and how to upgrade to.
 // details about the content of each of the versions can be found in the upgrade functions upgradeDatabaseSchemaXXXX
 // and their descriptions.
-var accountDBVersion = int32(3)
+var accountDBVersion = int32(4)
 
 type accountDelta struct {
 	old basics.AccountData
 	new basics.AccountData
 }
 
-// catchpointState is used to store catchpoint related varaibles into the catchpointstate table.
+// accountDeltaCount is an extention to accountDelta that is being used by the commitRound function for counting the
+// number of changes we've made per account. The ndeltas is used execlusively for consistency checking - making sure that
+// all the pending changes were written and that there are no outstanding writes missing.
+type accountDeltaCount struct {
+	accountDelta
+	ndeltas int
+}
+
+// catchpointState is used to store catchpoint related variables into the catchpointstate table.
 type catchpointState string
 
 const (
@@ -128,25 +148,44 @@ const (
 	catchpointStateCatchupBalancesRound = catchpointState("catchpointCatchupBalancesRound")
 )
 
-func writeCatchpointStagingCreatable(ctx context.Context, tx *sql.Tx, addr basics.Address, cidx basics.CreatableIndex, ctype basics.CreatableType) error {
-	_, err := tx.ExecContext(ctx, "INSERT INTO catchpointassetcreators(asset, creator, ctype) VALUES(?, ?, ?)", cidx, addr[:], ctype)
-	if err != nil {
-		return err
-	}
-	return nil
+// normalizedAccountBalance is a staging area for a catchpoint file account information before it's being added to the catchpoint staging tables.
+type normalizedAccountBalance struct {
+	address            basics.Address
+	accountData        basics.AccountData
+	encodedAccountData []byte
+	accountHash        []byte
+	normalizedBalance  uint64
 }
 
-func writeCatchpointStagingBalances(ctx context.Context, tx *sql.Tx, bals []encodedBalanceRecord) error {
-	insertStmt, err := tx.PrepareContext(ctx, "INSERT INTO catchpointbalances(address, data) VALUES(?, ?)")
+// prepareNormalizedBalances converts an array of encodedBalanceRecord into an equal size array of normalizedAccountBalances.
+func prepareNormalizedBalances(bals []encodedBalanceRecord, proto config.ConsensusParams) (normalizedAccountBalances []normalizedAccountBalance, err error) {
+	normalizedAccountBalances = make([]normalizedAccountBalance, len(bals), len(bals))
+	for i, balance := range bals {
+		normalizedAccountBalances[i].address = balance.Address
+		err = protocol.Decode(balance.AccountData, &(normalizedAccountBalances[i].accountData))
+		if err != nil {
+			return nil, err
+		}
+		normalizedAccountBalances[i].normalizedBalance = normalizedAccountBalances[i].accountData.NormalizedOnlineBalance(proto)
+		normalizedAccountBalances[i].encodedAccountData = balance.AccountData
+		normalizedAccountBalances[i].accountHash = accountHashBuilder(balance.Address, normalizedAccountBalances[i].accountData, balance.AccountData)
+	}
+	return
+}
+
+// writeCatchpointStagingBalances inserts all the account balances in the provided array into the catchpoint balance staging table catchpointbalances.
+func writeCatchpointStagingBalances(ctx context.Context, tx *sql.Tx, bals []normalizedAccountBalance) error {
+	insertStmt, err := tx.PrepareContext(ctx, "INSERT INTO catchpointbalances(address, normalizedonlinebalance, data) VALUES(?, ?, ?)")
 	if err != nil {
 		return err
 	}
 
 	for _, balance := range bals {
-		result, err := insertStmt.ExecContext(ctx, balance.Address[:], balance.AccountData)
+		result, err := insertStmt.ExecContext(ctx, balance.address[:], balance.normalizedBalance, balance.encodedAccountData)
 		if err != nil {
 			return err
 		}
+
 		aff, err := result.RowsAffected()
 		if err != nil {
 			return err
@@ -154,42 +193,133 @@ func writeCatchpointStagingBalances(ctx context.Context, tx *sql.Tx, bals []enco
 		if aff != 1 {
 			return fmt.Errorf("number of affected record in insert was expected to be one, but was %d", aff)
 		}
+	}
+	return nil
+}
 
+// writeCatchpointStagingBalances inserts all the account hashes in the provided array into the catchpoint pending hashes table catchpointpendinghashes.
+func writeCatchpointStagingHashes(ctx context.Context, tx *sql.Tx, bals []normalizedAccountBalance) error {
+	insertStmt, err := tx.PrepareContext(ctx, "INSERT INTO catchpointpendinghashes(data) VALUES(?)")
+	if err != nil {
+		return err
+	}
+
+	for _, balance := range bals {
+		result, err := insertStmt.ExecContext(ctx, balance.accountHash[:])
+		if err != nil {
+			return err
+		}
+
+		aff, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if aff != 1 {
+			return fmt.Errorf("number of affected record in insert was expected to be one, but was %d", aff)
+		}
+	}
+	return nil
+}
+
+// createCatchpointStagingHashesIndex creates an index on catchpointpendinghashes to allow faster scanning according to the hash order
+func createCatchpointStagingHashesIndex(ctx context.Context, tx *sql.Tx) (err error) {
+	_, err = tx.ExecContext(ctx, "CREATE INDEX IF NOT EXISTS catchpointpendinghashesidx ON catchpointpendinghashes(data)")
+	if err != nil {
+		return
+	}
+	return
+}
+
+// writeCatchpointStagingCreatable inserts all the creatables in the provided array into the catchpoint asset creator staging table catchpointassetcreators.
+func writeCatchpointStagingCreatable(ctx context.Context, tx *sql.Tx, bals []normalizedAccountBalance) error {
+	insertStmt, err := tx.PrepareContext(ctx, "INSERT INTO catchpointassetcreators(asset, creator, ctype) VALUES(?, ?, ?)")
+	if err != nil {
+		return err
+	}
+
+	for _, balance := range bals {
+		// if the account has any asset params, it means that it's the creator of an asset.
+		if len(balance.accountData.AssetParams) > 0 {
+			for aidx := range balance.accountData.AssetParams {
+				_, err := insertStmt.ExecContext(ctx, basics.CreatableIndex(aidx), balance.address[:], basics.AssetCreatable)
+				if err != nil {
+					return err
+				}
+			}
+		}
+
+		if len(balance.accountData.AppParams) > 0 {
+			for aidx := range balance.accountData.AppParams {
+				_, err := insertStmt.ExecContext(ctx, basics.CreatableIndex(aidx), balance.address[:], basics.AppCreatable)
+				if err != nil {
+					return err
+				}
+			}
+		}
 	}
 	return nil
 }
 
 func resetCatchpointStagingBalances(ctx context.Context, tx *sql.Tx, newCatchup bool) (err error) {
-	s := "DROP TABLE IF EXISTS catchpointbalances;"
-	s += "DROP TABLE IF EXISTS catchpointassetcreators;"
-	s += "DROP TABLE IF EXISTS catchpointaccounthashes;"
-	s += "DELETE FROM accounttotals where id='catchpointStaging';"
-	if newCatchup {
-		s += "CREATE TABLE IF NOT EXISTS catchpointassetcreators(asset integer primary key, creator blob, ctype integer);"
-		s += "CREATE TABLE IF NOT EXISTS catchpointbalances(address blob primary key, data blob);"
-		s += "CREATE TABLE IF NOT EXISTS catchpointaccounthashes(id integer primary key, data blob);"
+	s := []string{
+		"DROP TABLE IF EXISTS catchpointbalances",
+		"DROP TABLE IF EXISTS catchpointassetcreators",
+		"DROP TABLE IF EXISTS catchpointaccounthashes",
+		"DROP TABLE IF EXISTS catchpointpendinghashes",
+		"DELETE FROM accounttotals where id='catchpointStaging'",
 	}
-	_, err = tx.Exec(s)
-	return err
+
+	if newCatchup {
+		// SQLite has no way to rename an existing index.  So, we need
+		// to cook up a fresh name for the index, which will be kept
+		// around after we rename the table from "catchpointbalances"
+		// to "accountbase".  To construct a unique index name, we
+		// use the current time.
+		idxname := fmt.Sprintf("onlineaccountbals%d", time.Now().UnixNano())
+
+		s = append(s,
+			"CREATE TABLE IF NOT EXISTS catchpointassetcreators (asset integer primary key, creator blob, ctype integer)",
+			"CREATE TABLE IF NOT EXISTS catchpointbalances (address blob primary key, data blob, normalizedonlinebalance integer)",
+			"CREATE TABLE IF NOT EXISTS catchpointpendinghashes (data blob)",
+			"CREATE TABLE IF NOT EXISTS catchpointaccounthashes (id integer primary key, data blob)",
+			createNormalizedOnlineBalanceIndex(idxname, "catchpointbalances"),
+		)
+	}
+
+	for _, stmt := range s {
+		_, err = tx.Exec(stmt)
+		if err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 // applyCatchpointStagingBalances switches the staged catchpoint catchup tables onto the actual
 // tables and update the correct balance round. This is the final step in switching onto the new catchpoint round.
 func applyCatchpointStagingBalances(ctx context.Context, tx *sql.Tx, balancesRound basics.Round) (err error) {
-	s := "ALTER TABLE accountbase RENAME TO accountbase_old;"
-	s += "ALTER TABLE assetcreators RENAME TO assetcreators_old;"
-	s += "ALTER TABLE accounthashes RENAME TO accounthashes_old;"
-	s += "ALTER TABLE catchpointbalances RENAME TO accountbase;"
-	s += "ALTER TABLE catchpointassetcreators RENAME TO assetcreators;"
-	s += "ALTER TABLE catchpointaccounthashes RENAME TO accounthashes;"
-	s += "DROP TABLE IF EXISTS accountbase_old;"
-	s += "DROP TABLE IF EXISTS assetcreators_old;"
-	s += "DROP TABLE IF EXISTS accounthashes_old;"
+	stmts := []string{
+		"ALTER TABLE accountbase RENAME TO accountbase_old",
+		"ALTER TABLE assetcreators RENAME TO assetcreators_old",
+		"ALTER TABLE accounthashes RENAME TO accounthashes_old",
 
-	_, err = tx.Exec(s)
-	if err != nil {
-		return err
+		"ALTER TABLE catchpointbalances RENAME TO accountbase",
+		"ALTER TABLE catchpointassetcreators RENAME TO assetcreators",
+		"ALTER TABLE catchpointaccounthashes RENAME TO accounthashes",
+
+		"DROP TABLE IF EXISTS accountbase_old",
+		"DROP TABLE IF EXISTS assetcreators_old",
+		"DROP TABLE IF EXISTS accounthashes_old",
 	}
+
+	for _, stmt := range stmts {
+		_, err = tx.Exec(stmt)
+		if err != nil {
+			return err
+		}
+	}
+
 	_, err = tx.Exec("INSERT OR REPLACE INTO acctrounds(id, rnd) VALUES('acctbase', ?)", balancesRound)
 	if err != nil {
 		return err
@@ -259,7 +389,7 @@ func accountsInit(tx *sql.Tx, initAccounts map[basics.Address]basics.AccountData
 		}
 	} else {
 		serr, ok := err.(sqlite3.Error)
-		// serr.Code is sqlite.ErrConstraint if the database has already been initalized;
+		// serr.Code is sqlite.ErrConstraint if the database has already been initialized;
 		// in that case, ignore the error and return nil.
 		if !ok || serr.Code != sqlite3.ErrConstraint {
 			return err
@@ -267,6 +397,76 @@ func accountsInit(tx *sql.Tx, initAccounts map[basics.Address]basics.AccountData
 	}
 
 	return nil
+}
+
+// accountsAddNormalizedBalance adds the normalizedonlinebalance column
+// to the accountbase table.
+func accountsAddNormalizedBalance(tx *sql.Tx, proto config.ConsensusParams) error {
+	var exists bool
+	err := tx.QueryRow("SELECT 1 FROM pragma_table_info('accountbase') WHERE name='normalizedonlinebalance'").Scan(&exists)
+	if err == nil {
+		// Already exists.
+		return nil
+	}
+	if err != sql.ErrNoRows {
+		return err
+	}
+
+	for _, stmt := range createOnlineAccountIndex {
+		_, err := tx.Exec(stmt)
+		if err != nil {
+			return err
+		}
+	}
+
+	rows, err := tx.Query("SELECT address, data FROM accountbase")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var addrbuf []byte
+		var buf []byte
+		err = rows.Scan(&addrbuf, &buf)
+		if err != nil {
+			return err
+		}
+
+		var data basics.AccountData
+		err = protocol.Decode(buf, &data)
+		if err != nil {
+			return err
+		}
+
+		normBalance := data.NormalizedOnlineBalance(proto)
+		if normBalance > 0 {
+			_, err = tx.Exec("UPDATE accountbase SET normalizedonlinebalance=? WHERE address=?", normBalance, addrbuf)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return rows.Err()
+}
+
+// accountDataToOnline returns the part of the AccountData that matters
+// for online accounts (to answer top-N queries).  We store a subset of
+// the full AccountData because we need to store a large number of these
+// in memory (say, 1M), and storing that many AccountData could easily
+// cause us to run out of memory.
+func accountDataToOnline(address basics.Address, ad *basics.AccountData, proto config.ConsensusParams) *onlineAccount {
+	return &onlineAccount{
+		Address:                 address,
+		MicroAlgos:              ad.MicroAlgos,
+		RewardsBase:             ad.RewardsBase,
+		NormalizedOnlineBalance: ad.NormalizedOnlineBalance(proto),
+		VoteID:                  ad.VoteID,
+		VoteFirstValid:          ad.VoteFirstValid,
+		VoteLastValid:           ad.VoteLastValid,
+		VoteKeyDilution:         ad.VoteKeyDilution,
+	}
 }
 
 func resetAccountHashes(tx *sql.Tx) (err error) {
@@ -305,17 +505,17 @@ func accountsDbInit(r db.Queryable, w db.Queryable) (*accountsDbQueries, error) 
 	var err error
 	qs := &accountsDbQueries{}
 
-	qs.listCreatablesStmt, err = r.Prepare("SELECT asset, creator FROM assetcreators WHERE asset <= ? AND ctype = ? ORDER BY asset desc LIMIT ?")
+	qs.listCreatablesStmt, err = r.Prepare("SELECT rnd, asset, creator FROM acctrounds LEFT JOIN assetcreators ON assetcreators.asset <= ? AND assetcreators.ctype = ? WHERE acctrounds.id='acctbase' ORDER BY assetcreators.asset desc LIMIT ?")
 	if err != nil {
 		return nil, err
 	}
 
-	qs.lookupStmt, err = r.Prepare("SELECT data FROM accountbase WHERE address=?")
+	qs.lookupStmt, err = r.Prepare("SELECT rnd, data FROM acctrounds LEFT JOIN accountbase ON address=? WHERE id='acctbase'")
 	if err != nil {
 		return nil, err
 	}
 
-	qs.lookupCreatorStmt, err = r.Prepare("SELECT creator FROM assetcreators WHERE asset = ? AND ctype = ?")
+	qs.lookupCreatorStmt, err = r.Prepare("SELECT rnd, creator FROM acctrounds LEFT JOIN assetcreators ON asset = ? AND ctype = ? WHERE id='acctbase'")
 	if err != nil {
 		return nil, err
 	}
@@ -362,7 +562,8 @@ func accountsDbInit(r db.Queryable, w db.Queryable) (*accountsDbQueries, error) 
 	return qs, nil
 }
 
-func (qs *accountsDbQueries) listCreatables(maxIdx basics.CreatableIndex, maxResults uint64, ctype basics.CreatableType) (results []basics.CreatableLocator, err error) {
+// listCreatables returns an array of CreatableLocator which have CreatableIndex smaller or equal to maxIdx and are of the provided CreatableType.
+func (qs *accountsDbQueries) listCreatables(maxIdx basics.CreatableIndex, maxResults uint64, ctype basics.CreatableType) (results []basics.CreatableLocator, dbRound basics.Round, err error) {
 	err = db.Retry(func() error {
 		// Query for assets in range
 		rows, err := qs.listCreatablesStmt.Query(maxIdx, ctype, maxResults)
@@ -374,11 +575,17 @@ func (qs *accountsDbQueries) listCreatables(maxIdx basics.CreatableIndex, maxRes
 		// For each row, copy into a new CreatableLocator and append to results
 		var buf []byte
 		var cl basics.CreatableLocator
+		var creatableIndex sql.NullInt64
 		for rows.Next() {
-			err := rows.Scan(&cl.Index, &buf)
+			err = rows.Scan(&dbRound, &creatableIndex, &buf)
 			if err != nil {
 				return err
 			}
+			if !creatableIndex.Valid {
+				// we received an entry without any index. This would happen only on the first entry when there are no creatables of the requested type.
+				break
+			}
+			cl.Index = basics.CreatableIndex(creatableIndex.Int64)
 			copy(cl.Creator[:], buf)
 			cl.Type = ctype
 			results = append(results, cl)
@@ -388,14 +595,14 @@ func (qs *accountsDbQueries) listCreatables(maxIdx basics.CreatableIndex, maxRes
 	return
 }
 
-func (qs *accountsDbQueries) lookupCreator(cidx basics.CreatableIndex, ctype basics.CreatableType) (addr basics.Address, ok bool, err error) {
+func (qs *accountsDbQueries) lookupCreator(cidx basics.CreatableIndex, ctype basics.CreatableType) (addr basics.Address, ok bool, dbRound basics.Round, err error) {
 	err = db.Retry(func() error {
 		var buf []byte
-		err := qs.lookupCreatorStmt.QueryRow(cidx, ctype).Scan(&buf)
+		err := qs.lookupCreatorStmt.QueryRow(cidx, ctype).Scan(&dbRound, &buf)
 
-		// Common error: creatable does not exist
+		// this shouldn't happen unless we can't figure the round number.
 		if err == sql.ErrNoRows {
-			return nil
+			return fmt.Errorf("lookupCreator was unable to retrieve round number")
 		}
 
 		// Some other database error
@@ -403,24 +610,34 @@ func (qs *accountsDbQueries) lookupCreator(cidx basics.CreatableIndex, ctype bas
 			return err
 		}
 
-		ok = true
-		copy(addr[:], buf)
+		if len(buf) > 0 {
+			ok = true
+			copy(addr[:], buf)
+		}
 		return nil
 	})
 	return
 }
 
-func (qs *accountsDbQueries) lookup(addr basics.Address) (data basics.AccountData, err error) {
+// lookup looks up for a the account data given it's address. It returns the current database round and the matching
+// account data, if such was found. If no matching account data could be found for the given address, an empty account data would
+// be retrieved.
+func (qs *accountsDbQueries) lookup(addr basics.Address) (data basics.AccountData, dbRound basics.Round, err error) {
 	err = db.Retry(func() error {
 		var buf []byte
-		err := qs.lookupStmt.QueryRow(addr[:]).Scan(&buf)
+		err := qs.lookupStmt.QueryRow(addr[:]).Scan(&dbRound, &buf)
 		if err == nil {
-			return protocol.Decode(buf, &data)
+			if len(buf) > 0 {
+				return protocol.Decode(buf, &data)
+			}
+			// we don't have that account, just return the database round.
+			return nil
 		}
 
+		// this should never happen; it indicates that we don't have a current round in the acctrounds table.
 		if err == sql.ErrNoRows {
 			// Return the zero value of data
-			return nil
+			return fmt.Errorf("unable to query account data for address %v : %w", addr, err)
 		}
 
 		return err
@@ -554,6 +771,50 @@ func (qs *accountsDbQueries) close() {
 	}
 }
 
+// accountsOnlineTop returns the top n online accounts starting at position offset
+// (that is, the top offset'th account through the top offset+n-1'th account).
+//
+// The accounts are sorted by their normalized balance and address.  The normalized
+// balance has to do with the reward parts of online account balances.  See the
+// normalization procedure in AccountData.NormalizedOnlineBalance().
+//
+// Note that this does not check if the accounts have a vote key valid for any
+// particular round (past, present, or future).
+func accountsOnlineTop(tx *sql.Tx, offset, n uint64, proto config.ConsensusParams) (map[basics.Address]*onlineAccount, error) {
+	rows, err := tx.Query("SELECT address, data FROM accountbase WHERE normalizedonlinebalance>0 ORDER BY normalizedonlinebalance DESC, address DESC LIMIT ? OFFSET ?", n, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	res := make(map[basics.Address]*onlineAccount, n)
+	for rows.Next() {
+		var addrbuf []byte
+		var buf []byte
+		err = rows.Scan(&addrbuf, &buf)
+		if err != nil {
+			return nil, err
+		}
+
+		var data basics.AccountData
+		err = protocol.Decode(buf, &data)
+		if err != nil {
+			return nil, err
+		}
+
+		var addr basics.Address
+		if len(addrbuf) != len(addr) {
+			err = fmt.Errorf("Account DB address length mismatch: %d != %d", len(addrbuf), len(addr))
+			return nil, err
+		}
+
+		copy(addr[:], addrbuf)
+		res[addr] = accountDataToOnline(addr, &data, proto)
+	}
+
+	return res, rows.Err()
+}
+
 func accountsAll(tx *sql.Tx) (bals map[basics.Address]basics.AccountData, err error) {
 	rows, err := tx.Query("SELECT address, data FROM accountbase")
 	if err != nil {
@@ -619,7 +880,7 @@ func accountsPutTotals(tx *sql.Tx, totals AccountTotals, catchpointStaging bool)
 }
 
 // accountsNewRound updates the accountbase and assetcreators by applying the provided deltas to the accounts / creatables.
-func accountsNewRound(tx *sql.Tx, updates map[basics.Address]accountDelta, creatables map[basics.CreatableIndex]modifiedCreatable) (err error) {
+func accountsNewRound(tx *sql.Tx, updates map[basics.Address]accountDeltaCount, creatables map[basics.CreatableIndex]modifiedCreatable, proto config.ConsensusParams) (err error) {
 
 	var insertCreatableIdxStmt, deleteCreatableIdxStmt, deleteStmt, replaceStmt *sql.Stmt
 
@@ -629,7 +890,7 @@ func accountsNewRound(tx *sql.Tx, updates map[basics.Address]accountDelta, creat
 	}
 	defer deleteStmt.Close()
 
-	replaceStmt, err = tx.Prepare("REPLACE INTO accountbase (address, data) VALUES (?, ?)")
+	replaceStmt, err = tx.Prepare("REPLACE INTO accountbase (address, normalizedonlinebalance, data) VALUES (?, ?, ?)")
 	if err != nil {
 		return
 	}
@@ -640,12 +901,12 @@ func accountsNewRound(tx *sql.Tx, updates map[basics.Address]accountDelta, creat
 			// prune empty accounts
 			_, err = deleteStmt.Exec(addr[:])
 		} else {
-			_, err = replaceStmt.Exec(addr[:], protocol.Encode(&data.new))
+			normBalance := data.new.NormalizedOnlineBalance(proto)
+			_, err = replaceStmt.Exec(addr[:], normBalance, protocol.Encode(&data.new))
 		}
 		if err != nil {
 			return
 		}
-
 	}
 
 	if len(creatables) > 0 {
@@ -787,7 +1048,7 @@ func reencodeAccounts(ctx context.Context, tx *sql.Tx) (modifiedAccounts uint, e
 		// note that we should be quite liberal on timing here, since it might perform much slower
 		// on low-power devices.
 		if scannedAccounts%1000 == 0 {
-			// The return value from ResetTransactionWarnDeadline can be safely ignored here since it would only default to writing the warnning
+			// The return value from ResetTransactionWarnDeadline can be safely ignored here since it would only default to writing the warning
 			// message, which would let us know that it failed anyway.
 			db.ResetTransactionWarnDeadline(ctx, tx, time.Now().Add(time.Second))
 		}
@@ -837,10 +1098,6 @@ func reencodeAccounts(ctx context.Context, tx *sql.Tx) (modifiedAccounts uint, e
 	updateStmt.Close()
 	return
 }
-
-// merkleCommitterNodesPerPage controls how many nodes will be stored in a single page
-// value was calibrated using BenchmarkCalibrateNodesPerPage
-var merkleCommitterNodesPerPage = int64(116)
 
 type merkleCommitter struct {
 	tx         *sql.Tx
@@ -893,27 +1150,16 @@ func (mc *merkleCommitter) LoadPage(page uint64) (content []byte, err error) {
 	return content, nil
 }
 
-// GetNodesCountPerPage returns the page size ( number of nodes per page )
-func (mc *merkleCommitter) GetNodesCountPerPage() (pageSize int64) {
-	return merkleCommitterNodesPerPage
-}
-
 // encodedAccountsBatchIter allows us to iterate over the accounts data stored in the accountbase table.
 type encodedAccountsBatchIter struct {
-	rows           *sql.Rows
-	orderByAddress bool
+	rows *sql.Rows
 }
 
 // Next returns an array containing the account data, in the same way it appear in the database
 // returning accountCount accounts data at a time.
 func (iterator *encodedAccountsBatchIter) Next(ctx context.Context, tx *sql.Tx, accountCount int) (bals []encodedBalanceRecord, err error) {
 	if iterator.rows == nil {
-		if iterator.orderByAddress {
-			iterator.rows, err = tx.QueryContext(ctx, "SELECT address, data FROM accountbase ORDER BY address")
-		} else {
-			iterator.rows, err = tx.QueryContext(ctx, "SELECT address, data FROM accountbase")
-		}
-
+		iterator.rows, err = tx.QueryContext(ctx, "SELECT address, data FROM accountbase ORDER BY address")
 		if err != nil {
 			return
 		}
@@ -957,6 +1203,286 @@ func (iterator *encodedAccountsBatchIter) Next(ctx context.Context, tx *sql.Tx, 
 
 // Close shuts down the encodedAccountsBatchIter, releasing database resources.
 func (iterator *encodedAccountsBatchIter) Close() {
+	if iterator.rows != nil {
+		iterator.rows.Close()
+		iterator.rows = nil
+	}
+}
+
+// orderedAccountsIterStep is used by orderedAccountsIter to define the current step
+//msgp:ignore orderedAccountsIterStep
+type orderedAccountsIterStep int
+
+const (
+	// startup step
+	oaiStepStartup = orderedAccountsIterStep(0)
+	// delete old ordering table if we have any leftover from previous invocation
+	oaiStepDeleteOldOrderingTable = orderedAccountsIterStep(0)
+	// create new ordering table
+	oaiStepCreateOrderingTable = orderedAccountsIterStep(1)
+	// query the existing accounts
+	oaiStepQueryAccounts = orderedAccountsIterStep(2)
+	// iterate over the existing accounts and insert their hash & address into the staging ordering table
+	oaiStepInsertAccountData = orderedAccountsIterStep(3)
+	// create an index on the ordering table so that we can efficiently scan it.
+	oaiStepCreateOrderingAccountIndex = orderedAccountsIterStep(4)
+	// query the ordering table
+	oaiStepSelectFromOrderedTable = orderedAccountsIterStep(5)
+	// iterate over the ordering table
+	oaiStepIterateOverOrderedTable = orderedAccountsIterStep(6)
+	// cleanup and delete ordering table
+	oaiStepShutdown = orderedAccountsIterStep(7)
+	// do nothing as we're done.
+	oaiStepDone = orderedAccountsIterStep(8)
+)
+
+// orderedAccountsIter allows us to iterate over the accounts addresses in the order of the account hashes.
+type orderedAccountsIter struct {
+	step         orderedAccountsIterStep
+	rows         *sql.Rows
+	tx           *sql.Tx
+	accountCount int
+	insertStmt   *sql.Stmt
+}
+
+// makeOrderedAccountsIter creates an ordered account iterator. Note that due to implementation reasons,
+// only a single iterator can be active at a time.
+func makeOrderedAccountsIter(tx *sql.Tx, accountCount int) *orderedAccountsIter {
+	return &orderedAccountsIter{
+		tx:           tx,
+		accountCount: accountCount,
+		step:         oaiStepStartup,
+	}
+}
+
+// accountAddressHash is used by Next to return a single account address and the associated hash.
+type accountAddressHash struct {
+	address basics.Address
+	digest  []byte
+}
+
+// Next returns an array containing the account address and hash
+// the Next function works in multiple processing stages, where it first processs the current accounts and order them
+// followed by returning the ordered accounts. In the first phase, it would return empty accountAddressHash array
+// and sets the processedRecords to the number of accounts that were processed. On the second phase, the acct
+// would contain valid data ( and optionally the account data as well, if was asked in makeOrderedAccountsIter) and
+// the processedRecords would be zero. If err is sql.ErrNoRows it means that the iterator have completed it's work and no further
+// accounts exists. Otherwise, the caller is expected to keep calling "Next" to retrieve the next set of accounts
+// ( or let the Next function make some progress toward that goal )
+func (iterator *orderedAccountsIter) Next(ctx context.Context) (acct []accountAddressHash, processedRecords int, err error) {
+	if iterator.step == oaiStepDeleteOldOrderingTable {
+		// although we're going to delete this table anyway when completing the iterator execution, we'll try to
+		// clean up any intermediate table.
+		_, err = iterator.tx.ExecContext(ctx, "DROP TABLE IF EXISTS accountsiteratorhashes")
+		if err != nil {
+			return
+		}
+		iterator.step = oaiStepCreateOrderingTable
+		return
+	}
+	if iterator.step == oaiStepCreateOrderingTable {
+		// create the temporary table
+		_, err = iterator.tx.ExecContext(ctx, "CREATE TABLE accountsiteratorhashes(address blob, hash blob)")
+		if err != nil {
+			return
+		}
+		iterator.step = oaiStepQueryAccounts
+		return
+	}
+	if iterator.step == oaiStepQueryAccounts {
+		// iterate over the existing accounts
+		iterator.rows, err = iterator.tx.QueryContext(ctx, "SELECT address, data FROM accountbase")
+		if err != nil {
+			return
+		}
+		// prepare the insert statement into the temporary table
+		iterator.insertStmt, err = iterator.tx.PrepareContext(ctx, "INSERT INTO accountsiteratorhashes(address, hash) VALUES(?, ?)")
+		if err != nil {
+			return
+		}
+		iterator.step = oaiStepInsertAccountData
+		return
+	}
+	if iterator.step == oaiStepInsertAccountData {
+		var addr basics.Address
+		count := 0
+		for iterator.rows.Next() {
+			var addrbuf []byte
+			var buf []byte
+			err = iterator.rows.Scan(&addrbuf, &buf)
+			if err != nil {
+				iterator.Close(ctx)
+				return
+			}
+
+			if len(addrbuf) != len(addr) {
+				err = fmt.Errorf("Account DB address length mismatch: %d != %d", len(addrbuf), len(addr))
+				iterator.Close(ctx)
+				return
+			}
+
+			copy(addr[:], addrbuf)
+
+			var accountData basics.AccountData
+			err = protocol.Decode(buf, &accountData)
+			if err != nil {
+				iterator.Close(ctx)
+				return
+			}
+			hash := accountHashBuilder(addr, accountData, buf)
+			_, err = iterator.insertStmt.ExecContext(ctx, addrbuf, hash)
+			if err != nil {
+				iterator.Close(ctx)
+				return
+			}
+
+			count++
+			if count == iterator.accountCount {
+				// we're done with this iteration.
+				processedRecords = count
+				return
+			}
+		}
+		processedRecords = count
+		iterator.rows.Close()
+		iterator.rows = nil
+		iterator.insertStmt.Close()
+		iterator.insertStmt = nil
+		iterator.step = oaiStepCreateOrderingAccountIndex
+		return
+	}
+	if iterator.step == oaiStepCreateOrderingAccountIndex {
+		// create an index. It shown that even when we're making a single select statement in step 5, it would be better to have this index vs. not having it at all.
+		// note that this index is using the rowid of the accountsiteratorhashes table.
+		_, err = iterator.tx.ExecContext(ctx, "CREATE INDEX accountsiteratorhashesidx ON accountsiteratorhashes(hash)")
+		if err != nil {
+			iterator.Close(ctx)
+			return
+		}
+		iterator.step = oaiStepSelectFromOrderedTable
+		return
+	}
+	if iterator.step == oaiStepSelectFromOrderedTable {
+		// select the data from the ordered table
+		iterator.rows, err = iterator.tx.QueryContext(ctx, "SELECT address, hash FROM accountsiteratorhashes ORDER BY hash")
+
+		if err != nil {
+			iterator.Close(ctx)
+			return
+		}
+		iterator.step = oaiStepIterateOverOrderedTable
+		return
+	}
+
+	if iterator.step == oaiStepIterateOverOrderedTable {
+		acct = make([]accountAddressHash, 0, iterator.accountCount)
+		var addr basics.Address
+		for iterator.rows.Next() {
+			var addrbuf []byte
+			var hash []byte
+			err = iterator.rows.Scan(&addrbuf, &hash)
+			if err != nil {
+				iterator.Close(ctx)
+				return
+			}
+
+			if len(addrbuf) != len(addr) {
+				err = fmt.Errorf("Account DB address length mismatch: %d != %d", len(addrbuf), len(addr))
+				iterator.Close(ctx)
+				return
+			}
+
+			copy(addr[:], addrbuf)
+
+			acct = append(acct, accountAddressHash{address: addr, digest: hash})
+			if len(acct) == iterator.accountCount {
+				// we're done with this iteration.
+				return
+			}
+		}
+		iterator.step = oaiStepShutdown
+		iterator.rows.Close()
+		iterator.rows = nil
+		return
+	}
+	if iterator.step == oaiStepShutdown {
+		err = iterator.Close(ctx)
+		if err != nil {
+			return
+		}
+		iterator.step = oaiStepDone
+		// fallthrough
+	}
+	return nil, 0, sql.ErrNoRows
+}
+
+// Close shuts down the orderedAccountsBuilderIter, releasing database resources.
+func (iterator *orderedAccountsIter) Close(ctx context.Context) (err error) {
+	if iterator.rows != nil {
+		iterator.rows.Close()
+		iterator.rows = nil
+	}
+	if iterator.insertStmt != nil {
+		iterator.insertStmt.Close()
+		iterator.insertStmt = nil
+	}
+	_, err = iterator.tx.ExecContext(ctx, "DROP TABLE IF EXISTS accountsiteratorhashes")
+	return
+}
+
+// catchpointPendingHashesIterator allows us to iterate over the hashes in the catchpointpendinghashes table in their order.
+type catchpointPendingHashesIterator struct {
+	hashCount int
+	tx        *sql.Tx
+	rows      *sql.Rows
+}
+
+// makeCatchpointPendingHashesIterator create a pending hashes iterator that retrieves the hashes in the catchpointpendinghashes table.
+func makeCatchpointPendingHashesIterator(hashCount int, tx *sql.Tx) *catchpointPendingHashesIterator {
+	return &catchpointPendingHashesIterator{
+		hashCount: hashCount,
+		tx:        tx,
+	}
+}
+
+// Next returns an array containing the hashes, returning HashCount hashes at a time.
+func (iterator *catchpointPendingHashesIterator) Next(ctx context.Context) (hashes [][]byte, err error) {
+	if iterator.rows == nil {
+		iterator.rows, err = iterator.tx.QueryContext(ctx, "SELECT data FROM catchpointpendinghashes ORDER BY data")
+		if err != nil {
+			return
+		}
+	}
+
+	// gather up to accountCount encoded accounts.
+	hashes = make([][]byte, 0, iterator.hashCount)
+	for iterator.rows.Next() {
+		var hash []byte
+		err = iterator.rows.Scan(&hash)
+		if err != nil {
+			iterator.Close()
+			return
+		}
+
+		hashes = append(hashes, hash)
+		if len(hashes) == iterator.hashCount {
+			// we're done with this iteration.
+			return
+		}
+	}
+
+	err = iterator.rows.Err()
+	if err != nil {
+		iterator.Close()
+		return
+	}
+	// we just finished reading the table.
+	iterator.Close()
+	return
+}
+
+// Close shuts down the catchpointPendingHashesIterator, releasing database resources.
+func (iterator *catchpointPendingHashesIterator) Close() {
 	if iterator.rows != nil {
 		iterator.rows.Close()
 		iterator.rows = nil

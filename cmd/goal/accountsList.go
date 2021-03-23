@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -228,7 +228,8 @@ func (accountList *AccountsList) outputAccount(addr string, acctInfo v1.Account,
 	if len(acctInfo.AssetParams) > 0 {
 		var out []string
 		for curid, params := range acctInfo.AssetParams {
-			out = append(out, fmt.Sprintf("%d (%d %s)", curid, params.Total, params.UnitName))
+			_, unitName := unicodePrintable(params.UnitName)
+			out = append(out, fmt.Sprintf("%d (%d %s)", curid, params.Total, unitName))
 		}
 		fmt.Printf("\t[created asset IDs: %s]", strings.Join(out, ", "))
 	}

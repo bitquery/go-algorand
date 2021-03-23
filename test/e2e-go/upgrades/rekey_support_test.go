@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -17,8 +17,6 @@
 package upgrades
 
 import (
-	"fmt"
-	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -33,18 +31,7 @@ import (
 func TestRekeyUpgrade(t *testing.T) {
 	a := require.New(t)
 
-	// set the small lambda to 500 for the duration of this test.
-	roundTimeMs := 500
-	lambda := os.Getenv("ALGOSMALLLAMBDAMSEC")
-	os.Setenv("ALGOSMALLLAMBDAMSEC", fmt.Sprintf("%d", roundTimeMs))
-	defer func() {
-		if lambda == "" {
-			os.Unsetenv("ALGOSMALLLAMBDAMSEC")
-		} else {
-			os.Setenv("ALGOSMALLLAMBDAMSEC", lambda)
-		}
-	}()
-
+	smallLambdaMs := 500
 	consensus := makeApplicationUpgradeConsensus(t)
 
 	var fixture fixtures.RestClientFixture
@@ -108,7 +95,7 @@ func TestRekeyUpgrade(t *testing.T) {
 		require.NoError(t, err)
 
 		require.Less(t, int64(time.Now().Sub(startLoopTime)), int64(3*time.Minute))
-		time.Sleep(time.Duration(roundTimeMs) * time.Millisecond)
+		time.Sleep(time.Duration(smallLambdaMs) * time.Millisecond)
 		round = curStatus.LastRound
 	}
 

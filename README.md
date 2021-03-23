@@ -1,4 +1,4 @@
-[![Build Status](https://travis-ci.com/algorand/go-algorand.svg?token=25XP72ADqbCQJ3TJVC9S&branch=master)](https://travis-ci.com/algorand/go-algorand)
+[![Build Status](https://travis-ci.com/algorand/go-algorand.svg?branch=master)](https://travis-ci.com/algorand/go-algorand)
 
 go-algorand
 ====================
@@ -189,6 +189,6 @@ A number of packages provide utilities for the various components:
 
 Please see the [COPYING_FAQ](COPYING_FAQ) for details about how to apply our license.
 
-Copyright (C) 2019-2020, Algorand Inc.
+Copyright (C) 2019-2021, Algorand Inc.
 
 [developer site url]: https://developer.algorand.org/

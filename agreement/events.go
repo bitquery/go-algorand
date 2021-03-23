@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -636,6 +636,8 @@ type thresholdEvent struct {
 
 	// Bundle holds a quorum of votes which form the threshold.
 	Bundle unauthenticatedBundle
+
+	Proto protocol.ConsensusVersion
 }
 
 func (e thresholdEvent) t() eventType {

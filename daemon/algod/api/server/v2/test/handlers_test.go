@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -18,6 +18,7 @@ package test
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -34,6 +35,7 @@ import (
 	"github.com/algorand/go-algorand/data/transactions"
 	"github.com/algorand/go-algorand/data/transactions/logic"
 	"github.com/algorand/go-algorand/logging"
+	"github.com/algorand/go-algorand/node"
 	"github.com/algorand/go-algorand/protocol"
 )
 
@@ -42,7 +44,7 @@ func setupTestForMethodGet(t *testing.T) (v2.Handlers, echo.Context, *httptest.R
 	numTransactions := 1
 	offlineAccounts := true
 	mockLedger, rootkeys, _, stxns, releasefunc := testingenv(t, numAccounts, numTransactions, offlineAccounts)
-	mockNode := makeMockNode(mockLedger, t.Name())
+	mockNode := makeMockNode(mockLedger, t.Name(), nil)
 	dummyShutdownChan := make(chan struct{})
 	handler := v2.Handlers{
 		Node:     mockNode,
@@ -133,6 +135,7 @@ func TestGetStatus(t *testing.T) {
 		Catchpoint:                  &stat.Catchpoint,
 		CatchpointTotalAccounts:     &stat.CatchpointCatchupTotalAccounts,
 		CatchpointProcessedAccounts: &stat.CatchpointCatchupProcessedAccounts,
+		CatchpointVerifiedAccounts:  &stat.CatchpointCatchupVerifiedAccounts,
 		CatchpointTotalBlocks:       &stat.CatchpointCatchupTotalBlocks,
 		CatchpointAcquiredBlocks:    &stat.CatchpointCatchupAcquiredBlocks,
 	}
@@ -232,7 +235,7 @@ func postTransactionTest(t *testing.T, txnToUse, expectedCode int) {
 	mockLedger, _, _, stxns, releasefunc := testingenv(t, numAccounts, numTransactions, offlineAccounts)
 	defer releasefunc()
 	dummyShutdownChan := make(chan struct{})
-	mockNode := makeMockNode(mockLedger, t.Name())
+	mockNode := makeMockNode(mockLedger, t.Name(), nil)
 	handler := v2.Handlers{
 		Node:     mockNode,
 		Log:      logging.Base(),
@@ -260,14 +263,14 @@ func TestPostTransaction(t *testing.T) {
 	postTransactionTest(t, 0, 200)
 }
 
-func startCatchupTest(t *testing.T, catchpoint string, expectedCode int) {
+func startCatchupTest(t *testing.T, catchpoint string, nodeError error, expectedCode int) {
 	numAccounts := 1
 	numTransactions := 1
 	offlineAccounts := true
 	mockLedger, _, _, _, releasefunc := testingenv(t, numAccounts, numTransactions, offlineAccounts)
 	defer releasefunc()
 	dummyShutdownChan := make(chan struct{})
-	mockNode := makeMockNode(mockLedger, t.Name())
+	mockNode := makeMockNode(mockLedger, t.Name(), nodeError)
 	handler := v2.Handlers{
 		Node:     mockNode,
 		Log:      logging.Base(),
@@ -286,9 +289,18 @@ func TestStartCatchup(t *testing.T) {
 	t.Parallel()
 
 	goodCatchPoint := "5894690#DVFRZUYHEFKRLK5N6DNJRR4IABEVN2D6H76F3ZSEPIE6MKXMQWQA"
-	startCatchupTest(t, goodCatchPoint, 200)
+	startCatchupTest(t, goodCatchPoint, nil, 201)
+
+	inProgressError := node.MakeCatchpointAlreadyInProgressError("catchpoint")
+	startCatchupTest(t, goodCatchPoint, inProgressError, 200)
+
+	unableToStartError := node.MakeCatchpointUnableToStartError("running", "requested")
+	startCatchupTest(t, goodCatchPoint, unableToStartError, 400)
+
+	startCatchupTest(t, goodCatchPoint, errors.New("anothing else is internal"), 500)
+
 	badCatchPoint := "bad catchpoint"
-	startCatchupTest(t, badCatchPoint, 400)
+	startCatchupTest(t, badCatchPoint, nil, 400)
 }
 
 func abortCatchupTest(t *testing.T, catchpoint string, expectedCode int) {
@@ -298,7 +310,7 @@ func abortCatchupTest(t *testing.T, catchpoint string, expectedCode int) {
 	mockLedger, _, _, _, releasefunc := testingenv(t, numAccounts, numTransactions, offlineAccounts)
 	defer releasefunc()
 	dummyShutdownChan := make(chan struct{})
-	mockNode := makeMockNode(mockLedger, t.Name())
+	mockNode := makeMockNode(mockLedger, t.Name(), nil)
 	handler := v2.Handlers{
 		Node:     mockNode,
 		Log:      logging.Base(),
@@ -308,7 +320,7 @@ func abortCatchupTest(t *testing.T, catchpoint string, expectedCode int) {
 	req := httptest.NewRequest(http.MethodDelete, "/", nil)
 	rec := httptest.NewRecorder()
 	c := e.NewContext(req, rec)
-	err := handler.StartCatchup(c, catchpoint)
+	err := handler.AbortCatchup(c, catchpoint)
 	require.NoError(t, err)
 	require.Equal(t, expectedCode, rec.Code)
 }
@@ -329,7 +341,7 @@ func tealCompileTest(t *testing.T, bytesToUse []byte, expectedCode int, enableDe
 	mockLedger, _, _, _, releasefunc := testingenv(t, numAccounts, numTransactions, offlineAccounts)
 	defer releasefunc()
 	dummyShutdownChan := make(chan struct{})
-	mockNode := makeMockNode(mockLedger, t.Name())
+	mockNode := makeMockNode(mockLedger, t.Name(), nil)
 	mockNode.config.EnableDeveloperAPI = enableDeveloperAPI
 	handler := v2.Handlers{
 		Node:     &mockNode,
@@ -368,7 +380,7 @@ func tealDryrunTest(
 	mockLedger, _, _, _, releasefunc := testingenv(t, numAccounts, numTransactions, offlineAccounts)
 	defer releasefunc()
 	dummyShutdownChan := make(chan struct{})
-	mockNode := makeMockNode(mockLedger, t.Name())
+	mockNode := makeMockNode(mockLedger, t.Name(), nil)
 	mockNode.config.EnableDeveloperAPI = enableDeveloperAPI
 	handler := v2.Handlers{
 		Node:     &mockNode,
@@ -430,17 +442,17 @@ func TestTealDryrun(t *testing.T) {
 		gdr.Txns = append(gdr.Txns, enc)
 	}
 
-	sucProgram, err := logic.AssembleStringV2("int 1")
+	sucOps, err := logic.AssembleStringWithVersion("int 1", 2)
 	require.NoError(t, err)
 
-	failProgram, err := logic.AssembleStringV2("int 0")
+	failOps, err := logic.AssembleStringWithVersion("int 0", 2)
 	require.NoError(t, err)
 
 	gdr.Apps = []generated.Application{
 		{
 			Id: 1,
 			Params: generated.ApplicationParams{
-				ApprovalProgram: sucProgram,
+				ApprovalProgram: sucOps.Program,
 			},
 		},
 	}
@@ -478,7 +490,7 @@ func TestTealDryrun(t *testing.T) {
 	ddr := tealDryrunTest(t, &gdr, "json", 200, "PASS", true)
 	require.Equal(t, string(protocol.ConsensusFuture), ddr.ProtocolVersion)
 
-	gdr.Apps[0].Params.ApprovalProgram = failProgram
+	gdr.Apps[0].Params.ApprovalProgram = failOps.Program
 	tealDryrunTest(t, &gdr, "json", 200, "REJECT", true)
 	tealDryrunTest(t, &gdr, "msgp", 200, "REJECT", true)
 	tealDryrunTest(t, &gdr, "json", 404, "", false)

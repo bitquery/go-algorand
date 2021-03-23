@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -140,7 +140,7 @@ func (hts *HTTPTxSync) Sync(ctx context.Context, bloom *bloom.Filter) (txgroups 
 	default:
 		hts.log.Warn("txSync response status code : ", response.StatusCode)
 		response.Body.Close()
-		return nil, fmt.Errorf("txSync POST error response status code %d", response.StatusCode)
+		return nil, fmt.Errorf("txSync POST error response status code %d for '%s'. Request bloom filter length was %d bytes", response.StatusCode, syncURL, len(bloomParam))
 	}
 
 	// at this point, we've already receieved the response headers. ensure that the

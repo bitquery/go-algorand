@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -17,16 +17,24 @@
 package ledger
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"fmt"
+	"math/rand"
+	"os"
+	"sort"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
 	"github.com/algorand/go-algorand/config"
 	"github.com/algorand/go-algorand/crypto"
 	"github.com/algorand/go-algorand/data/basics"
+	"github.com/algorand/go-algorand/logging"
 	"github.com/algorand/go-algorand/protocol"
 )
 
@@ -52,7 +60,8 @@ func randomAccountData(rewardsLevel uint64) basics.AccountData {
 	}
 
 	data.RewardsBase = rewardsLevel
-
+	data.VoteFirstValid = 0
+	data.VoteLastValid = 1000
 	return data
 }
 
@@ -335,10 +344,14 @@ func checkAccounts(t *testing.T, tx *sql.Tx, rnd basics.Round, accts map[basics.
 	require.NoError(t, err)
 	defer aq.close()
 
+	proto := config.Consensus[protocol.ConsensusCurrentVersion]
+	err = accountsAddNormalizedBalance(tx, proto)
+	require.NoError(t, err)
+
 	var totalOnline, totalOffline, totalNotPart uint64
 
 	for addr, data := range accts {
-		d, err := aq.lookup(addr)
+		d, _, err := aq.lookup(addr)
 		require.NoError(t, err)
 		require.Equal(t, d, data)
 
@@ -366,9 +379,50 @@ func checkAccounts(t *testing.T, tx *sql.Tx, rnd basics.Round, accts map[basics.
 	require.Equal(t, totals.Participating().Raw, totalOnline+totalOffline)
 	require.Equal(t, totals.All().Raw, totalOnline+totalOffline+totalNotPart)
 
-	d, err := aq.lookup(randomAddress())
+	d, dbRound, err := aq.lookup(randomAddress())
 	require.NoError(t, err)
+	require.Equal(t, rnd, dbRound)
 	require.Equal(t, d, basics.AccountData{})
+
+	onlineAccounts := make(map[basics.Address]*onlineAccount)
+	for addr, data := range accts {
+		if data.Status == basics.Online {
+			onlineAccounts[addr] = accountDataToOnline(addr, &data, proto)
+		}
+	}
+
+	for i := 0; i < len(onlineAccounts); i++ {
+		dbtop, err := accountsOnlineTop(tx, 0, uint64(i), proto)
+		require.NoError(t, err)
+		require.Equal(t, i, len(dbtop))
+
+		// Compute the top-N accounts ourselves
+		var testtop []onlineAccount
+		for _, data := range onlineAccounts {
+			testtop = append(testtop, *data)
+		}
+
+		sort.Slice(testtop, func(i, j int) bool {
+			ibal := testtop[i].NormalizedOnlineBalance
+			jbal := testtop[j].NormalizedOnlineBalance
+			if ibal > jbal {
+				return true
+			}
+			if ibal < jbal {
+				return false
+			}
+			return bytes.Compare(testtop[i].Address[:], testtop[j].Address[:]) > 0
+		})
+
+		for j := 0; j < i; j++ {
+			_, ok := dbtop[testtop[j].Address]
+			require.True(t, ok)
+		}
+	}
+
+	top, err := accountsOnlineTop(tx, 0, uint64(len(onlineAccounts)+1), proto)
+	require.NoError(t, err)
+	require.Equal(t, len(top), len(onlineAccounts))
 }
 
 func TestAccountDBInit(t *testing.T) {
@@ -475,7 +529,9 @@ func TestAccountDBRound(t *testing.T) {
 		accts = newaccts
 		ctbsWithDeletes := randomCreatableSampling(i, ctbsList, randomCtbs,
 			expectedDbImage, numElementsPerSegement)
-		err = accountsNewRound(tx, updates, ctbsWithDeletes)
+
+		updatesCnt, _ := compactDeltas([]map[basics.Address]accountDelta{updates}, nil)
+		err = accountsNewRound(tx, updatesCnt, ctbsWithDeletes, proto)
 		require.NoError(t, err)
 		err = totalsNewRounds(tx, []map[basics.Address]accountDelta{updates}, []AccountTotals{{}}, []config.ConsensusParams{proto})
 		require.NoError(t, err)
@@ -545,7 +601,7 @@ func randomCreatableSampling(iteration int, crtbsList []basics.CreatableIndex,
 		ctb := creatables[crtbsList[i]]
 		if ctb.created &&
 			// Always delete the first element, to make sure at least one
-			// element is always deleted. 
+			// element is always deleted.
 			(i == delSegmentStart || 1 == (crypto.RandUint64()%2)) {
 			ctb.created = false
 			newSample[crtbsList[i]] = ctb
@@ -609,21 +665,15 @@ func randomCreatable(uniqueAssetIds map[basics.CreatableIndex]bool) (
 	return assetIdx, creatable
 }
 
-func BenchmarkReadingAllBalances(b *testing.B) {
-	proto := config.Consensus[protocol.ConsensusCurrentVersion]
-	//b.N = 50000
-	dbs, _ := dbOpenTest(b, true)
-	setDbLogging(b, dbs)
-	defer dbs.close()
-
+func benchmarkInitBalances(b testing.TB, numAccounts int, dbs dbPair, proto config.ConsensusParams) (updates map[basics.Address]basics.AccountData) {
 	tx, err := dbs.wdb.Handle.Begin()
 	require.NoError(b, err)
 
 	secrets := crypto.GenerateOneTimeSignatureSecrets(15, 500)
 	pubVrfKey, _ := crypto.VrfKeygenFromSeed([32]byte{0, 1, 2, 3})
-	updates := map[basics.Address]basics.AccountData{}
+	updates = make(map[basics.Address]basics.AccountData, numAccounts)
 
-	for i := 0; i < b.N; i++ {
+	for i := 0; i < numAccounts; i++ {
 		addr := randomAddress()
 		updates[addr] = basics.AccountData{
 			MicroAlgos:         basics.MicroAlgos{Raw: 0x000ffffffffffffff},
@@ -636,7 +686,7 @@ func BenchmarkReadingAllBalances(b *testing.B) {
 			VoteLastValid:      basics.Round(0x000ffffffffffffff),
 			VoteKeyDilution:    0x000ffffffffffffff,
 			AssetParams: map[basics.AssetIndex]basics.AssetParams{
-				0x000ffffffffffffff: basics.AssetParams{
+				0x000ffffffffffffff: {
 					Total:         0x000ffffffffffffff,
 					Decimals:      0x2ffffff,
 					DefaultFrozen: true,
@@ -651,7 +701,7 @@ func BenchmarkReadingAllBalances(b *testing.B) {
 				},
 			},
 			Assets: map[basics.AssetIndex]basics.AssetHolding{
-				0x000ffffffffffffff: basics.AssetHolding{
+				0x000ffffffffffffff: {
 					Amount: 0x000ffffffffffffff,
 					Frozen: true,
 				},
@@ -659,8 +709,26 @@ func BenchmarkReadingAllBalances(b *testing.B) {
 		}
 	}
 	accountsInit(tx, updates, proto)
-	tx.Commit()
-	tx, err = dbs.rdb.Handle.Begin()
+	err = tx.Commit()
+	require.NoError(b, err)
+	return
+}
+
+func cleanupTestDb(dbs dbPair, dbName string, inMemory bool) {
+	dbs.close()
+	if !inMemory {
+		os.Remove(dbName)
+	}
+}
+
+func benchmarkReadingAllBalances(b *testing.B, inMemory bool) {
+	proto := config.Consensus[protocol.ConsensusCurrentVersion]
+	dbs, fn := dbOpenTest(b, inMemory)
+	setDbLogging(b, dbs)
+	defer cleanupTestDb(dbs, fn, inMemory)
+
+	benchmarkInitBalances(b, b.N, dbs, proto)
+	tx, err := dbs.rdb.Handle.Begin()
 	require.NoError(b, err)
 
 	b.ResetTimer()
@@ -675,6 +743,50 @@ func BenchmarkReadingAllBalances(b *testing.B) {
 		prevHash = crypto.Hash(append(encodedAccountBalance, ([]byte(prevHash[:]))...))
 	}
 	require.Equal(b, b.N, len(bal))
+}
+
+func BenchmarkReadingAllBalancesRAM(b *testing.B) {
+	benchmarkReadingAllBalances(b, true)
+}
+
+func BenchmarkReadingAllBalancesDisk(b *testing.B) {
+	benchmarkReadingAllBalances(b, false)
+}
+
+func benchmarkReadingRandomBalances(b *testing.B, inMemory bool) {
+	proto := config.Consensus[protocol.ConsensusCurrentVersion]
+	dbs, fn := dbOpenTest(b, inMemory)
+	setDbLogging(b, dbs)
+	defer cleanupTestDb(dbs, fn, inMemory)
+
+	accounts := benchmarkInitBalances(b, b.N, dbs, proto)
+
+	qs, err := accountsDbInit(dbs.rdb.Handle, dbs.wdb.Handle)
+	require.NoError(b, err)
+
+	// read all the balances in the database, shuffled
+	addrs := make([]basics.Address, len(accounts))
+	pos := 0
+	for addr := range accounts {
+		addrs[pos] = addr
+		pos++
+	}
+	rand.Shuffle(len(addrs), func(i, j int) { addrs[i], addrs[j] = addrs[j], addrs[i] })
+
+	// only measure the actual fetch time
+	b.ResetTimer()
+	for _, addr := range addrs {
+		_, _, err = qs.lookup(addr)
+		require.NoError(b, err)
+	}
+}
+
+func BenchmarkReadingRandomBalancesRAM(b *testing.B) {
+	benchmarkReadingRandomBalances(b, true)
+}
+
+func BenchmarkReadingRandomBalancesDisk(b *testing.B) {
+	benchmarkReadingRandomBalances(b, false)
 }
 
 func TestAccountsReencoding(t *testing.T) {
@@ -717,7 +829,7 @@ func TestAccountsReencoding(t *testing.T) {
 				VoteLastValid:      basics.Round(0x000ffffffffffffff),
 				VoteKeyDilution:    0x000ffffffffffffff,
 				AssetParams: map[basics.AssetIndex]basics.AssetParams{
-					0x000ffffffffffffff: basics.AssetParams{
+					0x000ffffffffffffff: {
 						Total:         0x000ffffffffffffff,
 						Decimals:      0x2ffffff,
 						DefaultFrozen: true,
@@ -732,7 +844,7 @@ func TestAccountsReencoding(t *testing.T) {
 					},
 				},
 				Assets: map[basics.AssetIndex]basics.AssetHolding{
-					0x000ffffffffffffff: basics.AssetHolding{
+					0x000ffffffffffffff: {
 						Amount: 0x000ffffffffffffff,
 						Frozen: true,
 					},
@@ -784,4 +896,97 @@ func TestAccountsDbQueriesCreateClose(t *testing.T) {
 	require.Nil(t, qs.listCreatablesStmt)
 	qs.close()
 	require.Nil(t, qs.listCreatablesStmt)
+}
+
+func benchmarkWriteCatchpointStagingBalancesSub(b *testing.B, ascendingOrder bool) {
+	proto := config.Consensus[protocol.ConsensusCurrentVersion]
+	genesisInitState, _ := testGenerateInitState(b, protocol.ConsensusCurrentVersion)
+	const inMem = false
+	log := logging.TestingLog(b)
+	cfg := config.GetDefaultLocal()
+	cfg.Archival = false
+	log.SetLevel(logging.Warn)
+	dbBaseFileName := strings.Replace(b.Name(), "/", "_", -1)
+	l, err := OpenLedger(log, dbBaseFileName, inMem, genesisInitState, cfg)
+	require.NoError(b, err, "could not open ledger")
+	defer func() {
+		l.Close()
+		os.Remove(dbBaseFileName + ".block.sqlite")
+		os.Remove(dbBaseFileName + ".tracker.sqlite")
+	}()
+	catchpointAccessor := MakeCatchpointCatchupAccessor(l, log)
+	catchpointAccessor.ResetStagingBalances(context.Background(), true)
+	targetAccountsCount := uint64(b.N)
+	accountsLoaded := uint64(0)
+	var last64KStart time.Time
+	last64KSize := uint64(0)
+	last64KAccountCreationTime := time.Duration(0)
+	accountsWritingStarted := time.Now()
+	accountsGenerationDuration := time.Duration(0)
+	b.ResetTimer()
+	for accountsLoaded < targetAccountsCount {
+		b.StopTimer()
+		balancesLoopStart := time.Now()
+		// generate a chunk;
+		chunkSize := targetAccountsCount - accountsLoaded
+		if chunkSize > BalancesPerCatchpointFileChunk {
+			chunkSize = BalancesPerCatchpointFileChunk
+		}
+		last64KSize += chunkSize
+		if accountsLoaded >= targetAccountsCount-64*1024 && last64KStart.IsZero() {
+			last64KStart = time.Now()
+			last64KSize = chunkSize
+			last64KAccountCreationTime = time.Duration(0)
+		}
+		var balances catchpointFileBalancesChunk
+		balances.Balances = make([]encodedBalanceRecord, chunkSize)
+		for i := uint64(0); i < chunkSize; i++ {
+			var randomAccount encodedBalanceRecord
+			accountData := basics.AccountData{RewardsBase: accountsLoaded + i}
+			accountData.MicroAlgos.Raw = crypto.RandUint63()
+			randomAccount.AccountData = protocol.Encode(&accountData)
+			crypto.RandBytes(randomAccount.Address[:])
+			if ascendingOrder {
+				binary.LittleEndian.PutUint64(randomAccount.Address[:], accountsLoaded+i)
+			}
+			balances.Balances[i] = randomAccount
+		}
+		balanceLoopDuration := time.Now().Sub(balancesLoopStart)
+		last64KAccountCreationTime += balanceLoopDuration
+		accountsGenerationDuration += balanceLoopDuration
+
+		normalizedAccountBalances, err := prepareNormalizedBalances(balances.Balances, proto)
+		b.StartTimer()
+		err = l.trackerDBs.wdb.Atomic(func(ctx context.Context, tx *sql.Tx) (err error) {
+			err = writeCatchpointStagingBalances(ctx, tx, normalizedAccountBalances)
+			return
+		})
+
+		require.NoError(b, err)
+		accountsLoaded += chunkSize
+	}
+	if !last64KStart.IsZero() {
+		last64KDuration := time.Now().Sub(last64KStart) - last64KAccountCreationTime
+		fmt.Printf("%-82s%-7d (last 64k) %-6d ns/account       %d accounts/sec\n", b.Name(), last64KSize, (last64KDuration / time.Duration(last64KSize)).Nanoseconds(), int(float64(last64KSize)/float64(last64KDuration.Seconds())))
+	}
+	stats, err := l.trackerDBs.wdb.Vacuum(context.Background())
+	require.NoError(b, err)
+	fmt.Printf("%-82sdb fragmentation   %.1f%%\n", b.Name(), float32(stats.PagesBefore-stats.PagesAfter)*100/float32(stats.PagesBefore))
+	b.ReportMetric(float64(b.N)/float64((time.Now().Sub(accountsWritingStarted)-accountsGenerationDuration).Seconds()), "accounts/sec")
+}
+
+func BenchmarkWriteCatchpointStagingBalances(b *testing.B) {
+	benchSizes := []int{1024 * 100, 1024 * 200, 1024 * 400}
+	for _, size := range benchSizes {
+		b.Run(fmt.Sprintf("RandomInsertOrder-%d", size), func(b *testing.B) {
+			b.N = size
+			benchmarkWriteCatchpointStagingBalancesSub(b, false)
+		})
+	}
+	for _, size := range benchSizes {
+		b.Run(fmt.Sprintf("AscendingInsertOrder-%d", size), func(b *testing.B) {
+			b.N = size
+			benchmarkWriteCatchpointStagingBalancesSub(b, true)
+		})
+	}
 }

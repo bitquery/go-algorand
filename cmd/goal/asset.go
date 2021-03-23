@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -67,7 +67,7 @@ func init() {
 	createAssetCmd.MarkFlagRequired("creator")
 
 	destroyAssetCmd.Flags().StringVar(&assetManager, "manager", "", "Manager account to issue the destroy transaction (defaults to creator)")
-	destroyAssetCmd.Flags().StringVar(&assetCreator, "creator", "", "Account address for asset to destroy")
+	destroyAssetCmd.Flags().StringVar(&assetCreator, "creator", "", "Creator account address for asset to destroy")
 	destroyAssetCmd.Flags().Uint64Var(&assetID, "assetid", 0, "Asset ID to destroy")
 	destroyAssetCmd.Flags().StringVar(&assetUnitName, "asset", "", "Unit name of asset to destroy")
 
@@ -110,7 +110,8 @@ func init() {
 	addTxnFlags(freezeAssetCmd)
 
 	infoAssetCmd.Flags().Uint64Var(&assetID, "assetid", 0, "ID of the asset to look up")
-	infoAssetCmd.Flags().StringVar(&assetUnitName, "asset", "", "Unit name of the asset to look up")
+	infoAssetCmd.Flags().StringVar(&assetUnitName, "asset", "", "DEPRECATED! Unit name of the asset to look up")
+	infoAssetCmd.Flags().StringVar(&assetUnitName, "unitname", "", "Unit name of the asset to look up")
 	infoAssetCmd.Flags().StringVar(&assetCreator, "creator", "", "Account address of the asset creator")
 }
 
@@ -125,21 +126,31 @@ var assetCmd = &cobra.Command{
 }
 
 func lookupAssetID(cmd *cobra.Command, creator string, client libgoal.Client) {
-	if cmd.Flags().Changed("assetid") && cmd.Flags().Changed("asset") {
-		reportErrorf("Only one of [-assetid] or [-asset and -creator] can be specified")
+	if cmd.Flags().Changed("asset") {
+		reportWarnln("The [--asset] flag is deprecated and will be removed in a future release, use [--unitname] instead.")
+	}
+
+	if cmd.Flags().Changed("asset") && cmd.Flags().Changed("unitname") {
+		reportErrorf("The [--asset] flag has been replaced by [--unitname], do not provide both flags.")
+	}
+
+	assetOrUnit := cmd.Flags().Changed("asset") || cmd.Flags().Changed("unitname")
+
+	if cmd.Flags().Changed("assetid") && assetOrUnit {
+		reportErrorf("Only one of [--assetid] or [--unitname and --creator] should be specified")
 	}
 
 	if cmd.Flags().Changed("assetid") {
 		return
 	}
 
-	if !cmd.Flags().Changed("asset") {
-		reportErrorf("Either [-assetid] or [-asset and -creator]  must be specified")
+	if !assetOrUnit {
+		reportErrorf("Either [--assetid] or [--unitname and --creator] must be specified")
 	}
 
 	if !cmd.Flags().Changed("creator") {
 		reportErrorf("Asset creator must be specified if finding asset by name. " +
-			"Use the asset's integer identifier (-assetid) if the " +
+			"Use the asset's integer identifier [--assetid] if the " +
 			"creator account is unknown.")
 	}
 
@@ -245,7 +256,7 @@ var createAssetCmd = &cobra.Command{
 var destroyAssetCmd = &cobra.Command{
 	Use:   "destroy",
 	Short: "Destroy an asset",
-	Long:  `Issue a transaction deleting an asset from the network. This transaction must be issued by the asset owner, who must hold all outstanding asset tokens.`,
+	Long:  `Issue a transaction deleting an asset from the network. This transaction must be issued by the asset manager while the creator holds all of the asset's tokens.`,
 	Args:  validateNoPosArgsFn,
 	Run: func(cmd *cobra.Command, _ []string) {
 		checkTxValidityPeriodCmdFlags(cmd)
@@ -592,8 +603,8 @@ var infoAssetCmd = &cobra.Command{
 
 		fmt.Printf("Asset ID:         %d\n", assetID)
 		fmt.Printf("Creator:          %s\n", params.Creator)
-		fmt.Printf("Asset name:       %s\n", params.AssetName)
-		fmt.Printf("Unit name:        %s\n", params.UnitName)
+		reportInfof("Asset name:       %s\n", params.AssetName)
+		reportInfof("Unit name:        %s\n", params.UnitName)
 		fmt.Printf("Maximum issue:    %s %s\n", assetDecimalsFmt(params.Total, params.Decimals), params.UnitName)
 		fmt.Printf("Reserve amount:   %s %s\n", assetDecimalsFmt(res.Amount, params.Decimals), params.UnitName)
 		fmt.Printf("Issued:           %s %s\n", assetDecimalsFmt(params.Total-res.Amount, params.Decimals), params.UnitName)

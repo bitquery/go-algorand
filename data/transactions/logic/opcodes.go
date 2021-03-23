@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -154,16 +154,16 @@ var OpSpecs = []OpSpec{
 	{0x60, "balance", opBalance, asmDefault, disDefault, oneInt, oneInt, 2, runModeApplication, opSizeDefault},
 	{0x61, "app_opted_in", opAppCheckOptedIn, asmDefault, disDefault, twoInts, oneInt, 2, runModeApplication, opSizeDefault},
 	{0x62, "app_local_get", opAppGetLocalState, asmDefault, disDefault, oneInt.plus(oneBytes), oneAny, 2, runModeApplication, opSizeDefault},
-	{0x63, "app_local_get_ex", opAppGetLocalStateEx, asmDefault, disDefault, twoInts.plus(oneBytes), oneInt.plus(oneAny), 2, runModeApplication, opSizeDefault},
+	{0x63, "app_local_get_ex", opAppGetLocalStateEx, asmDefault, disDefault, twoInts.plus(oneBytes), oneAny.plus(oneInt), 2, runModeApplication, opSizeDefault},
 	{0x64, "app_global_get", opAppGetGlobalState, asmDefault, disDefault, oneBytes, oneAny, 2, runModeApplication, opSizeDefault},
-	{0x65, "app_global_get_ex", opAppGetGlobalStateEx, asmDefault, disDefault, oneInt.plus(oneBytes), oneInt.plus(oneAny), 2, runModeApplication, opSizeDefault},
+	{0x65, "app_global_get_ex", opAppGetGlobalStateEx, asmDefault, disDefault, oneInt.plus(oneBytes), oneAny.plus(oneInt), 2, runModeApplication, opSizeDefault},
 	{0x66, "app_local_put", opAppPutLocalState, asmDefault, disDefault, oneInt.plus(oneBytes).plus(oneAny), nil, 2, runModeApplication, opSizeDefault},
 	{0x67, "app_global_put", opAppPutGlobalState, asmDefault, disDefault, oneBytes.plus(oneAny), nil, 2, runModeApplication, opSizeDefault},
 	{0x68, "app_local_del", opAppDeleteLocalState, asmDefault, disDefault, oneInt.plus(oneBytes), nil, 2, runModeApplication, opSizeDefault},
 	{0x69, "app_global_del", opAppDeleteGlobalState, asmDefault, disDefault, oneBytes, nil, 2, runModeApplication, opSizeDefault},
 
-	{0x70, "asset_holding_get", opAssetHoldingGet, assembleAssetHolding, disAssetHolding, twoInts, oneInt.plus(oneAny), 2, runModeApplication, opSize{1, 2, nil}},
-	{0x71, "asset_params_get", opAssetParamsGet, assembleAssetParams, disAssetParams, oneInt, oneInt.plus(oneAny), 2, runModeApplication, opSize{1, 2, nil}},
+	{0x70, "asset_holding_get", opAssetHoldingGet, assembleAssetHolding, disAssetHolding, twoInts, oneAny.plus(oneInt), 2, runModeApplication, opSize{1, 2, nil}},
+	{0x71, "asset_params_get", opAssetParamsGet, assembleAssetParams, disAssetParams, oneInt, oneAny.plus(oneInt), 2, runModeApplication, opSize{1, 2, nil}},
 }
 
 type sortByOpcode []OpSpec
@@ -174,8 +174,6 @@ func (a sortByOpcode) Less(i, j int) bool { return a[i].Opcode < a[j].Opcode }
 
 // OpcodesByVersion returns list of opcodes available in a specific version of TEAL
 // by copying v1 opcodes to v2 to create a full list.
-// This function must be used for documentation only because it modifies opcode versions
-// to the first introduced for the opcodes updated in later versions.
 func OpcodesByVersion(version uint64) []OpSpec {
 	// for updated opcodes use the lowest version opcode was introduced in
 	maxOpcode := 0

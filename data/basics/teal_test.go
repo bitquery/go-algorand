@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -110,4 +110,116 @@ func TestSatisfiesSchema(t *testing.T) {
 	schema.NumByteSlice = 1
 	err = tkv.SatisfiesSchema(schema)
 	a.NoError(err)
+}
+
+func TestStateDeltaEqual(t *testing.T) {
+	a := require.New(t)
+
+	var d1 StateDelta = nil
+	var d2 StateDelta = nil
+	a.True(d1.Equal(d2))
+
+	d2 = StateDelta{}
+	a.True(d1.Equal(d2))
+
+	d2 = StateDelta{"test": {Action: SetUintAction, Uint: 0}}
+	a.False(d1.Equal(d2))
+
+	d1 = StateDelta{}
+	d2 = StateDelta{}
+	a.True(d1.Equal(d2))
+
+	d2 = StateDelta{"test": {Action: SetUintAction, Uint: 0}}
+	a.False(d1.Equal(d2))
+
+	d1 = StateDelta{"test2": {Action: SetBytesAction, Uint: 0}}
+	a.False(d1.Equal(d2))
+
+	d1 = StateDelta{"test": {Action: SetUintAction, Uint: 0}}
+	d2 = StateDelta{"test": {Action: SetUintAction, Uint: 0}}
+	a.True(d1.Equal(d2))
+
+	d1 = StateDelta{"test": {Action: SetBytesAction, Bytes: "val"}}
+	d2 = StateDelta{"test": {Action: SetBytesAction, Bytes: "val"}}
+	a.True(d1.Equal(d2))
+
+	d2 = StateDelta{"test": {Action: SetBytesAction, Bytes: "val1"}}
+	a.False(d1.Equal(d2))
+}
+
+func TestEvalDeltaEqual(t *testing.T) {
+	a := require.New(t)
+
+	d1 := EvalDelta{}
+	d2 := EvalDelta{}
+	a.True(d1.Equal(d2))
+
+	d2 = EvalDelta{
+		GlobalDelta: nil,
+		LocalDeltas: nil,
+	}
+	a.True(d1.Equal(d2))
+
+	d2 = EvalDelta{
+		GlobalDelta: StateDelta{},
+		LocalDeltas: map[uint64]StateDelta{},
+	}
+	a.True(d1.Equal(d2))
+
+	d2 = EvalDelta{
+		GlobalDelta: StateDelta{"test": {Action: SetUintAction, Uint: 0}},
+	}
+	a.False(d1.Equal(d2))
+
+	d1 = EvalDelta{
+		GlobalDelta: StateDelta{"test": {Action: SetUintAction, Uint: 0}},
+	}
+	a.True(d1.Equal(d2))
+
+	d2 = EvalDelta{
+		LocalDeltas: map[uint64]StateDelta{
+			0: {"test": {Action: SetUintAction, Uint: 0}},
+		},
+	}
+	a.False(d1.Equal(d2))
+
+	d1 = EvalDelta{
+		LocalDeltas: map[uint64]StateDelta{
+			0: {"test": {Action: SetUintAction, Uint: 1}},
+		},
+	}
+	a.False(d1.Equal(d2))
+
+	d2 = EvalDelta{
+		LocalDeltas: map[uint64]StateDelta{
+			0: {"test": {Action: SetUintAction, Uint: 1}},
+		},
+	}
+	a.True(d1.Equal(d2))
+
+	d1 = EvalDelta{
+		LocalDeltas: map[uint64]StateDelta{
+			0: {"test": {Action: SetBytesAction, Bytes: "val"}},
+		},
+	}
+	d2 = EvalDelta{
+		LocalDeltas: map[uint64]StateDelta{
+			0: {"test": {Action: SetBytesAction, Bytes: "val"}},
+		},
+	}
+	a.True(d1.Equal(d2))
+
+	d2 = EvalDelta{
+		LocalDeltas: map[uint64]StateDelta{
+			0: {"test": {Action: SetBytesAction, Bytes: "val1"}},
+		},
+	}
+	a.False(d1.Equal(d2))
+
+	d2 = EvalDelta{
+		LocalDeltas: map[uint64]StateDelta{
+			1: {"test": {Action: SetBytesAction, Bytes: "val"}},
+		},
+	}
+	a.False(d1.Equal(d2))
 }

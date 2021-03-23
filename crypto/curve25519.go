@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -25,6 +25,8 @@ package crypto
 // #cgo linux,arm64 LDFLAGS: ${SRCDIR}/libs/linux/arm64/lib/libsodium.a
 // #cgo linux,arm CFLAGS: -I${SRCDIR}/libs/linux/arm/include
 // #cgo linux,arm LDFLAGS: ${SRCDIR}/libs/linux/arm/lib/libsodium.a
+// #cgo windows,amd64 CFLAGS: -I${SRCDIR}/libs/windows/amd64/include
+// #cgo windows,amd64 LDFLAGS: ${SRCDIR}/libs/windows/amd64/lib/libsodium.a
 // #include <stdint.h>
 // #include "sodium.h"
 import "C"
@@ -122,6 +124,14 @@ func ed25519Verify(public ed25519PublicKey, data []byte, sig ed25519Signature) b
 // A Signature is a cryptographic signature. It proves that a message was
 // produced by a holder of a cryptographic secret.
 type Signature ed25519Signature
+
+// BlankSignature is an empty signature structure, containing nothing but zeroes
+var BlankSignature = Signature{}
+
+// Blank tests to see if the given signature contains only zeros
+func (s *Signature) Blank() bool {
+	return (*s) == BlankSignature
+}
 
 // A SignatureVerifier is used to identify the holder of SignatureSecrets
 // and verify the authenticity of Signatures.

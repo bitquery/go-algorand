@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -28,6 +28,10 @@ const (
 	AuctionParams     HashID = "aP"
 	AuctionSettlement HashID = "aS"
 
+	CompactCertCoin HashID = "ccc"
+	CompactCertPart HashID = "ccp"
+	CompactCertSig  HashID = "ccs"
+
 	AgreementSelector HashID = "AS"
 	BlockHeader       HashID = "BH"
 	BalanceRecord     HashID = "BR"
@@ -44,6 +48,7 @@ const (
 	ProgramData       HashID = "ProgData"
 	ProposerSeed      HashID = "PS"
 	Seed              HashID = "SD"
+	SpecialAddr       HashID = "SpecialAddr"
 	TestHashable      HashID = "TE"
 	TxGroup           HashID = "TG"
 	Transaction       HashID = "TX"

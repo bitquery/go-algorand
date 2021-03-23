@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -e
 
+./scripts/check_golang_version.sh dev
+
 HELP="Usage: $0 [-s]
 Installs host level dependencies necessary to build go-algorand.
 
@@ -41,9 +43,33 @@ function install_or_upgrade {
     fi
 }
 
+function install_windows_shellcheck() {
+    version="v0.7.1"
+    if ! wget https://github.com/koalaman/shellcheck/releases/download/$version/shellcheck-$version.zip -O /tmp/shellcheck-$version.zip; then
+        rm /tmp/shellcheck-$version.zip &> /dev/null
+        echo "Error downloading shellcheck $version"
+        return 1
+    fi
+
+    if ! unzip -o /tmp/shellcheck-$version.zip shellcheck-$version.exe -d /tmp; then
+        rm /tmp/shellcheck-$version.zip &> /dev/null
+        echo "Unable to decompress shellcheck $version"
+        return 1
+    fi
+
+    if ! mv -f /tmp/shellcheck-$version.exe /usr/bin/shellcheck.exe; then
+        rm /tmp/shellcheck-$version.zip &> /dev/null
+        echo "Unable to move shellcheck to /usr/bin"
+        return 1
+    fi
+
+    rm /tmp/shellcheck-$version.zip &> /dev/null
+
+    return 0
+}
+
 if [ "${OS}" = "linux" ]; then
-    if ! which sudo > /dev/null
-    then
+    if ! which sudo > /dev/null; then
         apt-get update
         apt-get -y install sudo
     fi
@@ -61,11 +87,20 @@ elif [ "${OS}" = "darwin" ]; then
     install_or_upgrade automake
     install_or_upgrade shellcheck
     install_or_upgrade python3
+elif [ "${OS}" = "windows" ]; then
+    if ! $msys2 pacman -S --disable-download-timeout --noconfirm git automake autoconf m4 libtool make mingw-w64-x86_64-gcc mingw-w64-x86_64-boost mingw-w64-x86_64-python mingw-w64-x86_64-jq unzip procps; then
+        echo "Error installing pacman dependencies"
+        exit 1
+    fi
+
+    if ! install_windows_shellcheck; then
+        exit 1
+    fi
 fi
 
-if ${SKIP_GO_DEPS} ; then
+if ${SKIP_GO_DEPS}; then
     exit 0
 fi
 
-"$SCRIPTPATH"/configure_dev-deps.sh
+"$SCRIPTPATH/configure_dev-deps.sh"
 

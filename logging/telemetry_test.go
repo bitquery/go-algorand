@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -18,13 +18,16 @@ package logging
 
 import (
 	"fmt"
+	"os"
 	"testing"
 	"time"
 
-	"github.com/algorand/go-deadlock"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
+	"github.com/algorand/go-deadlock"
+
+	"github.com/algorand/go-algorand/config"
 	"github.com/algorand/go-algorand/logging/telemetryspec"
 )
 
@@ -58,7 +61,6 @@ func makeMockTelemetryHook(level logrus.Level) mockTelemetryHook {
 }
 
 type telemetryTestFixture struct {
-	cfg   TelemetryConfig
 	hook  mockTelemetryHook
 	telem *telemetryState
 	l     logger
@@ -70,20 +72,22 @@ func makeTelemetryTestFixture(minLevel logrus.Level) *telemetryTestFixture {
 
 func makeTelemetryTestFixtureWithConfig(minLevel logrus.Level, cfg *TelemetryConfig) *telemetryTestFixture {
 	f := &telemetryTestFixture{}
+	var lcfg TelemetryConfig
 	if cfg == nil {
-		f.cfg = createTelemetryConfig()
+		lcfg = createTelemetryConfig()
 	} else {
-		f.cfg = *cfg
+		lcfg = *cfg
 	}
-	f.cfg.Enable = true
-	f.cfg.MinLogLevel = minLevel
+	lcfg.Enable = true
+	lcfg.MinLogLevel = minLevel
 	f.hook = makeMockTelemetryHook(minLevel)
 	f.l = Base().(logger)
 	f.l.SetLevel(Debug) // Ensure logging doesn't filter anything out
 
-	f.telem, _ = makeTelemetryState(f.cfg, func(cfg TelemetryConfig) (hook logrus.Hook, err error) {
+	f.telem, _ = makeTelemetryState(lcfg, func(cfg TelemetryConfig) (hook logrus.Hook, err error) {
 		return &f.hook, nil
 	})
+	f.l.loggerState.telemetry = f.telem
 	return f
 }
 
@@ -146,7 +150,7 @@ func TestTelemetryHook(t *testing.T) {
 	a := require.New(t)
 	f := makeTelemetryTestFixture(logrus.InfoLevel)
 
-	a.NotNil(f.telem)
+	a.NotNil(f.l.loggerState.telemetry)
 	a.Zero(len(f.hookEntries()))
 
 	f.telem.logMetrics(f.l, testString1, testMetrics{}, nil)
@@ -313,4 +317,22 @@ func TestLogHistoryLevels(t *testing.T) {
 	a.NotNil(data[4]["log"]) // Error
 	a.Nil(data[5]["log"])    // Panic - this is stack trace
 	a.NotNil(data[6]["log"]) // Panic
+}
+
+func TestReadTelemetryConfigOrDefaultNoDataDir(t *testing.T) {
+	a := require.New(t)
+	tempDir := os.TempDir()
+	originalGlobalConfigFileRoot, _ := config.GetGlobalConfigFileRoot()
+	config.SetGlobalConfigFileRoot(tempDir)
+
+	cfg, err := ReadTelemetryConfigOrDefault("", "")
+	defaultCfgSettings := createTelemetryConfig()
+	config.SetGlobalConfigFileRoot(originalGlobalConfigFileRoot)
+
+	a.Nil(err)
+	a.NotNil(cfg)
+	a.NotEqual(TelemetryConfig{}, cfg)
+	a.Equal(defaultCfgSettings.UserName, cfg.UserName)
+	a.Equal(defaultCfgSettings.Password, cfg.Password)
+	a.Equal(len(defaultCfgSettings.GUID), len(cfg.GUID))
 }

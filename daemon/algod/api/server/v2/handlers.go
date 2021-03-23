@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -110,7 +110,7 @@ func (v2 *Handlers) AccountInformation(ctx echo.Context, address string, params 
 		return ctx.Blob(http.StatusOK, contentType, data)
 	}
 
-	recordWithoutPendingRewards, err := myLedger.LookupWithoutRewards(lastRound, addr)
+	recordWithoutPendingRewards, _, err := myLedger.LookupWithoutRewards(lastRound, addr)
 	if err != nil {
 		return internalError(ctx, err, errFailedLookingUpLedger, v2.Log)
 	}
@@ -222,6 +222,7 @@ func (v2 *Handlers) GetStatus(ctx echo.Context) error {
 		Catchpoint:                  &stat.Catchpoint,
 		CatchpointTotalAccounts:     &stat.CatchpointCatchupTotalAccounts,
 		CatchpointProcessedAccounts: &stat.CatchpointCatchupProcessedAccounts,
+		CatchpointVerifiedAccounts:  &stat.CatchpointCatchupVerifiedAccounts,
 		CatchpointTotalBlocks:       &stat.CatchpointCatchupTotalBlocks,
 		CatchpointAcquiredBlocks:    &stat.CatchpointCatchupAcquiredBlocks,
 	}
@@ -563,12 +564,21 @@ func (v2 *Handlers) startCatchup(ctx echo.Context, catchpoint string) error {
 		return badRequest(ctx, err, errFailedToParseCatchpoint, v2.Log)
 	}
 
+	// Select 200/201, or return an error
+	var code int
 	err = v2.Node.StartCatchup(catchpoint)
-	if err != nil {
+	switch err.(type) {
+	case nil:
+		code = http.StatusCreated
+	case *node.CatchpointAlreadyInProgressError:
+		code = http.StatusOK
+	case *node.CatchpointUnableToStartError:
+		return badRequest(ctx, err, err.Error(), v2.Log)
+	default:
 		return internalError(ctx, err, fmt.Sprintf(errFailedToStartCatchup, err), v2.Log)
 	}
 
-	return ctx.JSON(http.StatusOK, private.CatchpointStartResponse{
+	return ctx.JSON(code, private.CatchpointStartResponse{
 		CatchupMessage: catchpoint,
 	})
 }
@@ -682,16 +692,15 @@ func (v2 *Handlers) TealCompile(ctx echo.Context) error {
 	ctx.Request().Body = http.MaxBytesReader(nil, ctx.Request().Body, maxTealSourceBytes)
 	buf.ReadFrom(ctx.Request().Body)
 	source := buf.String()
-	program, err := logic.AssembleString(source)
+	ops, err := logic.AssembleString(source)
 	if err != nil {
 		return badRequest(ctx, err, err.Error(), v2.Log)
 	}
-
-	pd := logic.HashProgram(program)
+	pd := logic.HashProgram(ops.Program)
 	addr := basics.Address(pd)
 	response := generated.CompileResponse{
 		Hash:   addr.String(),
-		Result: base64.StdEncoding.EncodeToString(program),
+		Result: base64.StdEncoding.EncodeToString(ops.Program),
 	}
 	return ctx.JSON(http.StatusOK, response)
 }

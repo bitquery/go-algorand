@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -1249,9 +1249,9 @@ func (cx *evalContext) assetParamsEnumToValue(params *basics.AssetParams, field 
 }
 
 // TxnFieldToTealValue is a thin wrapper for txnFieldToStack for external use
-func TxnFieldToTealValue(txn *transactions.Transaction, groupIndex int, field TxnField) (basics.TealValue, error) {
+func TxnFieldToTealValue(txn *transactions.Transaction, groupIndex int, field TxnField, arrayFieldIdx uint64) (basics.TealValue, error) {
 	cx := evalContext{EvalParams: EvalParams{GroupIndex: groupIndex}}
-	sv, err := cx.txnFieldToStack(txn, field, 0, groupIndex)
+	sv, err := cx.txnFieldToStack(txn, field, arrayFieldIdx, groupIndex)
 	return sv.toTealValue(), err
 }
 
@@ -1303,7 +1303,7 @@ func (cx *evalContext) txnFieldToStack(txn *transactions.Transaction, field TxnF
 	case Type:
 		sv.Bytes = []byte(txn.Type)
 	case TypeEnum:
-		sv.Uint = uint64(txnTypeIndexes[string(txn.Type)])
+		sv.Uint = txnTypeIndexes[string(txn.Type)]
 	case XferAsset:
 		sv.Uint = uint64(txn.XferAsset)
 	case AssetAmount:

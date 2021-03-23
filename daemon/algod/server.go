@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -34,6 +34,7 @@ import (
 
 	"github.com/algorand/go-algorand/config"
 	apiServer "github.com/algorand/go-algorand/daemon/algod/api/server"
+	"github.com/algorand/go-algorand/daemon/algod/api/server/lib"
 	"github.com/algorand/go-algorand/data/bookkeeping"
 	"github.com/algorand/go-algorand/logging"
 	"github.com/algorand/go-algorand/logging/telemetryspec"
@@ -59,9 +60,11 @@ type Server struct {
 }
 
 // Initialize creates a Node instance with applicable network services
-func (s *Server) Initialize(cfg config.Local, phonebookAddresses []string) error {
+func (s *Server) Initialize(cfg config.Local, phonebookAddresses []string, genesisText string) error {
 	// set up node
 	s.log = logging.Base()
+
+	lib.GenesisJSONText = genesisText
 
 	liveLog := filepath.Join(s.RootPath, "node.log")
 	archive := filepath.Join(s.RootPath, cfg.LogArchiveName)
@@ -100,10 +103,12 @@ func (s *Server) Initialize(cfg config.Local, phonebookAddresses []string) error
 	// collected metrics decorations.
 	fmt.Fprintln(logWriter, "++++++++++++++++++++++++++++++++++++++++")
 	fmt.Fprintln(logWriter, "Logging Starting")
-	if s.log.GetTelemetryEnabled() {
+	if s.log.GetTelemetryUploadingEnabled() {
+		// May or may not be logging to node.log
 		fmt.Fprintf(logWriter, "Telemetry Enabled: %s\n", s.log.GetTelemetryHostName())
 		fmt.Fprintf(logWriter, "Session: %s\n", s.log.GetTelemetrySession())
 	} else {
+		// May or may not be logging to node.log
 		fmt.Fprintln(logWriter, "Telemetry Disabled")
 	}
 	fmt.Fprintln(logWriter, "++++++++++++++++++++++++++++++++++++++++")
@@ -201,13 +206,9 @@ func (s *Server) Start() {
 
 	e := apiServer.NewRouter(s.log, s.node, s.stopping, apiToken, adminAPIToken, tcpListener)
 
-	errChan := make(chan error, 1)
-	go func() {
-		err := e.StartServer(&server)
-		errChan <- err
-	}()
-
 	// Set up files for our PID and our listening address
+	// before beginning to listen to prevent 'goal node start'
+	// quit earlier than these service files get created
 	s.pidFile = filepath.Join(s.RootPath, "algod.pid")
 	s.netFile = filepath.Join(s.RootPath, "algod.net")
 	ioutil.WriteFile(s.pidFile, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0644)
@@ -218,6 +219,12 @@ func (s *Server) Start() {
 		s.netListenFile = filepath.Join(s.RootPath, "algod-listen.net")
 		ioutil.WriteFile(s.netListenFile, []byte(fmt.Sprintf("%s\n", listenAddr)), 0644)
 	}
+
+	errChan := make(chan error, 1)
+	go func() {
+		err := e.StartServer(&server)
+		errChan <- err
+	}()
 
 	// Handle signals cleanly
 	c := make(chan os.Signal)

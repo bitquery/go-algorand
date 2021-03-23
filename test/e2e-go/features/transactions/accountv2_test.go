@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -17,9 +17,9 @@
 package transactions
 
 import (
-	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 
@@ -38,11 +38,9 @@ func TestAccountInformationV2(t *testing.T) {
 	var fixture fixtures.RestClientFixture
 	proto, ok := config.Consensus[protocol.ConsensusFuture]
 	a.True(ok)
-	os.Setenv("ALGOSMALLLAMBDAMSEC", "200")
+	proto.AgreementFilterTimeoutPeriod0 = 400 * time.Millisecond
+	proto.AgreementFilterTimeout = 400 * time.Millisecond
 	fixture.SetConsensus(config.ConsensusProtocols{protocol.ConsensusFuture: proto})
-	defer func() {
-		os.Unsetenv("ALGOSMALLLAMBDAMSEC")
-	}()
 
 	fixture.Setup(t, filepath.Join("nettemplates", "TwoNodes50EachFuture.json"))
 	defer fixture.Shutdown()
@@ -66,7 +64,7 @@ func TestAccountInformationV2(t *testing.T) {
 	// Fund the manager, so it can issue transactions later on
 	_, err = client.SendPaymentFromUnencryptedWallet(creator, user, fee, 10000000000, nil)
 	a.NoError(err)
-	client.WaitForRound(round + 2)
+	client.WaitForRound(round + 4)
 
 	// There should be no apps to start with
 	ad, err := client.AccountData(creator)
@@ -102,9 +100,9 @@ int 1  // increment
 app_local_put
 int 1
 `
-	approval, err := logic.AssembleString(counter)
+	approvalOps, err := logic.AssembleString(counter)
 	a.NoError(err)
-	clearstate, err := logic.AssembleString("#pragma version 2\nint 1")
+	clearstateOps, err := logic.AssembleString("#pragma version 2\nint 1")
 	a.NoError(err)
 	schema := basics.StateSchema{
 		NumUint: 1,
@@ -112,7 +110,7 @@ int 1
 
 	// create the app
 	tx, err := client.MakeUnsignedAppCreateTx(
-		transactions.OptInOC, approval, clearstate, schema, schema, nil, nil, nil, nil,
+		transactions.OptInOC, approvalOps.Program, clearstateOps.Program, schema, schema, nil, nil, nil, nil,
 	)
 	a.NoError(err)
 	tx, err = client.FillUnsignedTxTemplate(creator, 0, 0, fee, tx)
@@ -136,8 +134,8 @@ int 1
 		params = p
 		break
 	}
-	a.Equal(approval, params.ApprovalProgram)
-	a.Equal(clearstate, params.ClearStateProgram)
+	a.Equal(approvalOps.Program, params.ApprovalProgram)
+	a.Equal(clearstateOps.Program, params.ClearStateProgram)
 	a.Equal(schema, params.LocalStateSchema)
 	a.Equal(schema, params.GlobalStateSchema)
 	a.Equal(1, len(params.GlobalState))
@@ -173,8 +171,8 @@ int 1
 	a.Equal(1, len(ad.AppParams))
 	params, ok = ad.AppParams[appIdx]
 	a.True(ok)
-	a.Equal(approval, params.ApprovalProgram)
-	a.Equal(clearstate, params.ClearStateProgram)
+	a.Equal(approvalOps.Program, params.ApprovalProgram)
+	a.Equal(clearstateOps.Program, params.ClearStateProgram)
 	a.Equal(schema, params.LocalStateSchema)
 	a.Equal(schema, params.GlobalStateSchema)
 	a.Equal(1, len(params.GlobalState))

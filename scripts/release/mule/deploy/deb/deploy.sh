@@ -2,78 +2,78 @@
 
 set -ex
 
-echo
-date "+build_release begin SNAPSHOT stage %Y%m%d_%H%M%S"
-echo
-
-ARCH_BIT=$(uname -m)
-ARCH_TYPE=$(./scripts/archtype.sh)
-OS_TYPE=$(./scripts/ostype.sh)
-VERSION=${VERSION:-$(./scripts/compute_build_number.sh -f)}
-BRANCH=${BRANCH:-$(git rev-parse --abbrev-ref HEAD)}
-CHANNEL=${CHANNEL:-$(./scripts/compute_branch_channel.sh "$BRANCH")}
-PKG_DIR="./tmp/node_pkgs/$OS_TYPE/$ARCH_TYPE"
-SIGNING_KEY_ADDR=dev@algorand.com
-
-chmod 400 "$HOME/.gnupg"
-
-if ! $USE_CACHE
+if [ -z "$NETWORK" ]
 then
-    export ARCH_BIT
-    export ARCH_TYPE
-    export CHANNEL
-    export OS_TYPE
-    export VERSION
-
-    mule -f package-deploy.yaml package-deploy-setup-deb
+    echo "[$0] Network is a required parameter."
+    exit 1
 fi
 
-apt-get install aptly -y
+if [ -z "$STAGING" ]
+then
+    echo "[$0] Staging is a required parameter."
+    exit 1
+fi
 
-cat <<EOF>"${HOME}/.aptly.conf"
-{
-  "rootDir": "${HOME}/aptly",
-  "downloadConcurrency": 4,
-  "downloadSpeedLimit": 0,
-  "architectures": [],
-  "dependencyFollowSuggests": false,
-  "dependencyFollowRecommends": false,
-  "dependencyFollowAllVariants": false,
-  "dependencyFollowSource": false,
-  "dependencyVerboseResolve": false,
-  "gpgDisableSign": false,
-  "gpgDisableVerify": false,
-  "gpgProvider": "gpg",
-  "downloadSourcePackages": false,
-  "skipLegacyPool": true,
-  "ppaDistributorID": "ubuntu",
-  "ppaCodename": "",
-  "skipContentsPublishing": false,
-  "FileSystemPublishEndpoints": {},
-  "S3PublishEndpoints": {
-    "algorand-releases": {
-      "region":"us-east-1",
-      "bucket":"algorand-releases",
-      "acl":"public-read",
-      "prefix":"deb"
-    }
-  },
-  "SwiftPublishEndpoints": {}
-}
-EOF
+CHANNEL=$("./scripts/release/mule/common/get_channel.sh" "$NETWORK")
+VERSION=${VERSION:-$(./scripts/compute_build_number.sh -f)}
 
-DEBS_DIR="$HOME/packages/deb/$CHANNEL"
-DEB="algorand_${CHANNEL}_linux-amd64_${VERSION}.deb"
+if [ -z "$SNAPSHOT" ]
+then
+    SNAPSHOT="$CHANNEL-$VERSION"
+fi
 
-cp "$PKG_DIR/$DEB" "$DEBS_DIR"
+PACKAGES_DIR=/root/packages
+mkdir -p /root/packages
 
-SNAPSHOT="${CHANNEL}-${VERSION}"
-aptly repo create -distribution="$CHANNEL" -component=main algorand
-aptly repo add algorand "$DEBS_DIR"/*.deb
-aptly snapshot create "$SNAPSHOT" from repo algorand
-aptly publish snapshot -gpg-key="$SIGNING_KEY_ADDR" -origin=Algorand -label=Algorand "$SNAPSHOT" "s3:algorand-releases:"
+aptly mirror update stable
+aptly mirror update beta
 
-echo
-date "+build_release end SNAPSHOT stage %Y%m%d_%H%M%S"
-echo
+# aptly repo import <src-mirror> <dst-repo> <package-query> ...
+aptly repo import stable stable algorand algorand-devtools
+aptly repo import beta beta algorand-beta algorand-devtools-beta
+
+KEY_PREFIX="$CHANNEL/$VERSION"
+FILENAME_SUFFIX="${CHANNEL}_linux-amd64_${VERSION}.deb"
+ALGORAND_KEY="$KEY_PREFIX/algorand_${FILENAME_SUFFIX}"
+DEVTOOLS_KEY="$KEY_PREFIX/algorand-devtools_${FILENAME_SUFFIX}"
+
+# `STAGING` could contain a "path" (i.e. "my_bucket/foo/bar"), but the
+# `s3api` api expects it to be only the bucket name (i.e., "my_bucket").
+BUCKET=$(awk -F/ '{ print $1 }' <<< "$STAGING")
+
+# If the strings match then the objects are in the top-level of the bucket.
+if [ "$STAGING" = "$BUCKET" ]
+then
+    BUCKET_PREFIX_PATH="$STAGING"
+else
+    # Remove matching prefix.
+    BUCKET_PREFIX_PATH=${STAGING#$BUCKET"/"}
+fi
+
+for key in {"$ALGORAND_KEY","$DEVTOOLS_KEY"}
+do
+    key="$BUCKET_PREFIX_PATH/$key"
+    if aws s3api head-object --bucket "$BUCKET" --key "$key"
+    then
+        aws s3 cp "s3://$BUCKET/$key" "$PACKAGES_DIR"
+    else
+        echo "[$0] The package \`$key\` failed to download."
+    fi
+done
+
+if ls -A $PACKAGES_DIR
+then
+    aptly repo add "$CHANNEL" "$PACKAGES_DIR"/*.deb
+    aptly repo show -with-packages "$CHANNEL"
+    aptly snapshot create "$SNAPSHOT" from repo "$CHANNEL"
+    if ! aptly publish show "$CHANNEL" s3:algorand-releases: &> /dev/null
+    then
+        aptly publish snapshot -gpg-key=dev@algorand.com -origin=Algorand -label=Algorand "$SNAPSHOT" s3:algorand-releases:
+    else
+        aptly publish switch "$CHANNEL" s3:algorand-releases: "$SNAPSHOT"
+    fi
+else
+    echo "[$0] The packages directory is empty, so there is nothing to add the \`$CHANNEL\` repo."
+    exit 1
+fi
 

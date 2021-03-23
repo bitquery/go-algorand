@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -21,11 +21,11 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
 	"github.com/spf13/cobra/doc"
-	"golang.org/x/sys/unix"
 
 	"github.com/algorand/go-algorand/cmd/kmd/codes"
 	"github.com/algorand/go-algorand/daemon/kmd"
@@ -93,8 +93,8 @@ func runKmd(dataDir string, timeoutSecs uint64) {
 	// Timeouts can also send on the kill channel; because signal.Notify
 	// will not block, this shouldn't cause an issue. From docs: "Package
 	// signal will not block sending to c"
-	signal.Notify(kill, os.Interrupt, unix.SIGTERM, unix.SIGINT)
-	signal.Ignore(unix.SIGHUP)
+	signal.Notify(kill, os.Interrupt, syscall.SIGTERM, syscall.SIGINT)
+	signal.Ignore(syscall.SIGHUP)
 
 	// Build a kmd StartConfig
 	startConfig := kmd.StartConfig{

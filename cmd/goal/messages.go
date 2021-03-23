@@ -1,4 +1,4 @@
-// Copyright (C) 2019-2020 Algorand, Inc.
+// Copyright (C) 2019-2021 Algorand, Inc.
 // This file is part of go-algorand
 //
 // go-algorand is free software: you can redistribute it and/or modify
@@ -18,12 +18,14 @@ package main
 
 const (
 	// General
-	errorNoDataDirectory     = "Data directory not specified.  Please use -d or set $ALGORAND_DATA in your environment. Exiting."
-	errorOneDataDirSupported = "Only one data directory can be specified for this command."
-	errorRequestFail         = "Error processing command: %s"
-	errorGenesisIDFail       = "Error determining kmd folder (%s). Ensure the node is running in %s."
-	errorDirectoryNotExist   = "Specified directory '%s' does not exist."
-	errorParseAddr           = "Failed to parse addr: %v"
+	errorNoDataDirectory        = "Data directory not specified.  Please use -d or set $ALGORAND_DATA in your environment. Exiting."
+	errorOneDataDirSupported    = "Only one data directory can be specified for this command."
+	errorRequestFail            = "Error processing command: %s"
+	errorGenesisIDFail          = "Error determining kmd folder (%s). Ensure the node is running in %s."
+	errorDirectoryNotExist      = "Specified directory '%s' does not exist."
+	errorParseAddr              = "Failed to parse addr: %v"
+	errorNonPrintableCharacters = "One or more non-printable characters were ommited from the following error message:"
+	infoNonPrintableCharacters  = "One or more non-printable characters were ommited from the subsequent line:"
 
 	// Account
 	infoNoAccounts                 = "Did not find any account. Please import or create a new one."
@@ -62,12 +64,12 @@ const (
 	infoNodeStatus                    = "Last committed block: %d\nTime since last block: %s\nSync Time: %s\nLast consensus protocol: %s\nNext consensus protocol: %s\nRound for next consensus protocol: %d\nNext consensus protocol supported: %v"
 	catchupStoppedOnUnsupported       = "Last supported block (%d) is committed. The next block consensus protocol is not supported. Catchup service is stopped."
 	infoNodeCatchpointCatchupStatus   = "Last committed block: %d\nSync Time: %s\nCatchpoint: %s"
-	infoNodeCatchpointCatchupAccounts = "Catchpoint total accounts: %d\nCatchpoint accounts processed: %d"
+	infoNodeCatchpointCatchupAccounts = "Catchpoint total accounts: %d\nCatchpoint accounts processed: %d\nCatchpoint accounts verified: %d"
 	infoNodeCatchpointCatchupBlocks   = "Catchpoint total blocks: %d\nCatchpoint downloaded blocks: %d"
 	nodeLastCatchpoint                = "Last Catchpoint: %s"
 	errorNodeCreationIPFailure        = "Parsing passed IP %v failed: need a valid IPv4 or IPv6 address with a specified port number"
 	errorNodeNotDetected              = "Algorand node does not appear to be running: %s"
-	errorNodeStatus                   = "Cannot contact Algorand node: %s."
+	errorNodeStatus                   = "Cannot contact Algorand node: %s"
 	errorNodeFailedToStart            = "Algorand node failed to start: %s"
 	errorNodeRunning                  = "Node must be stopped before writing APIToken"
 	errorNodeFailGenToken             = "Cannot generate API token: %s"
