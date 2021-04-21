@@ -39,7 +39,7 @@ import (
 	"github.com/algorand/go-algorand/data/bookkeeping"
 	"github.com/algorand/go-algorand/data/transactions"
 	"github.com/algorand/go-algorand/data/transactions/logic"
-	"github.com/algorand/go-algorand/ledger"
+	"github.com/algorand/go-algorand/ledger/ledgercore"
 	"github.com/algorand/go-algorand/node"
 	"github.com/algorand/go-algorand/protocol"
 	"github.com/algorand/go-algorand/rpcs"
@@ -78,8 +78,7 @@ func decorateUnknownTransactionTypeError(err error, txs node.TxnWithStatus) erro
 // txEncode copies the data fields of the internal transaction object and populate the v1.Transaction accordingly.
 // if unexpected transaction type is encountered, an error is returned. The caller is expected to ignore the returned
 // transaction when error is non-nil.
-func txEncode(signedTx transactions.SignedTxn, ad transactions.ApplyData) (v1.Transaction, error) {
-	var tx transactions.Transaction = signedTx.Txn
+func txEncode(tx transactions.Transaction, ad transactions.ApplyData) (v1.Transaction, error) {
 	var res v1.Transaction
 	switch tx.Type {
 	case protocol.PaymentTx:
@@ -94,6 +93,8 @@ func txEncode(signedTx transactions.SignedTxn, ad transactions.ApplyData) (v1.Tr
 		res = assetFreezeTxEncode(tx, ad)
 	case protocol.ApplicationCallTx:
 		res = applicationCallTxEncode(tx, ad)
+	case protocol.CompactCertTx:
+		res = compactCertTxEncode(tx, ad)
 	default:
 		return res, errors.New(errUnknownTransactionType)
 	}
@@ -349,6 +350,10 @@ func assetTransferTxEncode(tx transactions.Transaction, ad transactions.ApplyDat
 		xfer.CloseTo = tx.AssetTransferTxnFields.AssetCloseTo.String()
 	}
 
+	if ad.AssetClosingAmount != 0 {
+		xfer.CloseToAmount = ad.AssetClosingAmount
+	}
+
 	return v1.Transaction{
 		AssetTransfer: &xfer,
 	}
@@ -366,8 +371,19 @@ func assetFreezeTxEncode(tx transactions.Transaction, ad transactions.ApplyData)
 	}
 }
 
+func compactCertTxEncode(tx transactions.Transaction, ad transactions.ApplyData) v1.Transaction {
+	cc := v1.CompactCertTransactionType{
+		CertRound: uint64(tx.CompactCertTxnFields.CertRound),
+		Cert:      protocol.Encode(&tx.CompactCertTxnFields.Cert),
+	}
+
+	return v1.Transaction{
+		CompactCert: &cc,
+	}
+}
+
 func txWithStatusEncode(tr node.TxnWithStatus) (v1.Transaction, error) {
-	s, err := txEncode(tr.Txn, tr.ApplyData)
+	s, err := txEncode(tr.Txn.Txn, tr.ApplyData)
 	if err != nil {
 		err = decorateUnknownTransactionTypeError(err, tr)
 		return v1.Transaction{}, err
@@ -490,6 +506,13 @@ func blockEncode(b bookkeeping.Block, c agreement.Certificate) (v1.Block, error)
 			UpgradePropose: string(b.UpgradePropose),
 			UpgradeApprove: b.UpgradeApprove,
 		},
+		CompactCertVotersTotal: b.CompactCert[protocol.CompactCertBasic].CompactCertVotersTotal.ToUint64(),
+		CompactCertNextRound:   uint64(b.CompactCert[protocol.CompactCertBasic].CompactCertNextRound),
+	}
+
+	if !b.CompactCert[protocol.CompactCertBasic].CompactCertVoters.IsZero() {
+		voters := b.CompactCert[protocol.CompactCertBasic].CompactCertVoters
+		block.CompactCertVoters = voters[:]
 	}
 
 	// Transactions
@@ -1119,7 +1142,7 @@ func GetPendingTransactions(ctx lib.ReqContext, context echo.Context) {
 
 	responseTxs := make([]v1.Transaction, len(txs))
 	for i, twr := range txs {
-		responseTxs[i], err = txEncode(twr, transactions.ApplyData{})
+		responseTxs[i], err = txEncode(twr.Txn, transactions.ApplyData{})
 		if err != nil {
 			// update the error as needed
 			err = decorateUnknownTransactionTypeError(err, node.TxnWithStatus{Txn: twr})
@@ -1226,7 +1249,7 @@ func GetPendingTransactionsByAddress(ctx lib.ReqContext, context echo.Context) {
 				break
 			}
 
-			tx, err := txEncode(twr, transactions.ApplyData{})
+			tx, err := txEncode(twr.Txn, transactions.ApplyData{})
 			responseTxs = append(responseTxs, tx)
 			if err != nil {
 				// update the error as needed
