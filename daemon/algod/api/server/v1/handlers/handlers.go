@@ -384,7 +384,7 @@ func compactCertTxEncode(tx transactions.Transaction, ad transactions.ApplyData)
 }
 
 func txWithStatusEncode(tr node.TxnWithStatus) (v1.Transaction, error) {
-	s, err := txEncode(tr.Txn.Txn, tr.ApplyData)
+	s, err := txEncode(tr.Txn, tr.ApplyData)
 	if err != nil {
 		err = decorateUnknownTransactionTypeError(err, tr)
 		return v1.Transaction{}, err
@@ -1143,7 +1143,7 @@ func GetPendingTransactions(ctx lib.ReqContext, context echo.Context) {
 
 	responseTxs := make([]v1.Transaction, len(txs))
 	for i, twr := range txs {
-		responseTxs[i], err = txEncode(twr.Txn, transactions.ApplyData{})
+		responseTxs[i], err = txEncode(twr, transactions.ApplyData{})
 		if err != nil {
 			// update the error as needed
 			err = decorateUnknownTransactionTypeError(err, node.TxnWithStatus{Txn: twr})
@@ -1250,7 +1250,7 @@ func GetPendingTransactionsByAddress(ctx lib.ReqContext, context echo.Context) {
 				break
 			}
 
-			tx, err := txEncode(twr.Txn, transactions.ApplyData{})
+			tx, err := txEncode(twr, transactions.ApplyData{})
 			responseTxs = append(responseTxs, tx)
 			if err != nil {
 				// update the error as needed
