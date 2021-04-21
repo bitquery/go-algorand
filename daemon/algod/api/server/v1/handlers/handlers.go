@@ -78,7 +78,8 @@ func decorateUnknownTransactionTypeError(err error, txs node.TxnWithStatus) erro
 // txEncode copies the data fields of the internal transaction object and populate the v1.Transaction accordingly.
 // if unexpected transaction type is encountered, an error is returned. The caller is expected to ignore the returned
 // transaction when error is non-nil.
-func txEncode(tx transactions.Transaction, ad transactions.ApplyData) (v1.Transaction, error) {
+func txEncode(signedTx transactions.SignedTxn, ad transactions.ApplyData) (v1.Transaction, error) {
+	var tx = signedTx.Txn
 	var res v1.Transaction
 	switch tx.Type {
 	case protocol.PaymentTx:
@@ -1772,7 +1773,7 @@ func Transactions(ctx lib.ReqContext, context echo.Context) {
 		txs, err = ctx.Node.ListTxns(addr, basics.Round(fR), basics.Round(lR))
 		if err != nil {
 			switch err.(type) {
-			case ledger.ErrNoEntry:
+			case ledgercore.ErrNoEntry:
 				if !ctx.Node.IsArchival() {
 					lib.ErrorResponse(w, http.StatusInternalServerError, err, errBlockHashBeenDeletedArchival, ctx.Log)
 					return
