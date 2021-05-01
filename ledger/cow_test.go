@@ -63,7 +63,7 @@ func (ml *mockLedger) allocated(addr basics.Address, aidx basics.AppIndex, globa
 	return true, nil
 }
 
-func (ml *mockLedger) getKey(addr basics.Address, aidx basics.AppIndex, global bool, key string) (basics.TealValue, bool, error) {
+func (ml *mockLedger) getKey(addr basics.Address, aidx basics.AppIndex, global bool, key string, accountIdx uint64) (basics.TealValue, bool, error) {
 	return basics.TealValue{}, false, nil
 }
 
@@ -105,7 +105,7 @@ func TestCowBalance(t *testing.T) {
 	c0 := makeRoundCowState(&ml, bookkeeping.BlockHeader{}, 0, 0)
 	checkCow(t, c0, accts0)
 
-	c1 := c0.child()
+	c1 := c0.child(0)
 	checkCow(t, c0, accts0)
 	checkCow(t, c1, accts0)
 
@@ -114,7 +114,7 @@ func TestCowBalance(t *testing.T) {
 	checkCow(t, c0, accts0)
 	checkCow(t, c1, accts1)
 
-	c2 := c1.child()
+	c2 := c1.child(0)
 	checkCow(t, c0, accts0)
 	checkCow(t, c1, accts1)
 	checkCow(t, c2, accts1)

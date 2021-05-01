@@ -137,7 +137,7 @@ func (x *roundCowBase) allocated(addr basics.Address, aidx basics.AppIndex, glob
 
 // getKey gets the value for a particular key in some storage
 // associated with an application globally or locally
-func (x *roundCowBase) getKey(addr basics.Address, aidx basics.AppIndex, global bool, key string) (basics.TealValue, bool, error) {
+func (x *roundCowBase) getKey(addr basics.Address, aidx basics.AppIndex, global bool, key string, accountIdx uint64) (basics.TealValue, bool, error) {
 	ad, _, err := x.l.LookupWithoutRewards(x.rnd, addr)
 	if err != nil {
 		return basics.TealValue{}, false, err
@@ -581,7 +581,7 @@ func (eval *BlockEvaluator) TestTransactionGroup(txgroup []transactions.SignedTx
 		return fmt.Errorf("group size %d exceeds maximum %d", len(txgroup), eval.proto.MaxTxGroupSize)
 	}
 
-	cow := eval.state.child()
+	cow := eval.state.child(len(txgroup))
 
 	var group transactions.TxGroup
 	for gi, txn := range txgroup {
@@ -715,7 +715,7 @@ func (eval *BlockEvaluator) transactionGroup(txgroup []transactions.SignedTxnWit
 	var group transactions.TxGroup
 	var groupTxBytes int
 
-	cow := eval.state.child()
+	cow := eval.state.child(len(txgroup))
 
 	// Prepare eval params for any ApplicationCall transactions in the group
 	evalParams := eval.prepareEvalParams(txgroup)
@@ -1009,6 +1009,7 @@ func (eval *BlockEvaluator) endOfBlock() error {
 
 // FinalValidation does the validation that must happen after the block is built and all state updates are computed
 func (eval *BlockEvaluator) finalValidation() error {
+	eval.state.mods.OptimizeAllocatedMemory(eval.proto)
 	if eval.validate {
 		// check commitments
 		txnRoot, err := eval.block.PaysetCommit()

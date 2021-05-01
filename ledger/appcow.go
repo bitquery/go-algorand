@@ -25,6 +25,7 @@ import (
 	"github.com/algorand/go-algorand/data/transactions"
 	"github.com/algorand/go-algorand/data/transactions/logic"
 	"github.com/algorand/go-algorand/ledger/apply"
+	"github.com/algorand/go-algorand/ledger/ledgercore"
 	"github.com/algorand/go-algorand/protocol"
 )
 
@@ -91,10 +92,15 @@ type storageDelta struct {
 	kvCow  stateDelta
 
 	counts, maxCounts *basics.StateSchema
+
+	// account index for an address that was first referenced as in app_local_get/app_local_put/app_local_del
+	// this is for backward compatibility with original implementation of applications
+	// it is set only once on storageDelta creation and used only for local delta generation
+	accountIdx uint64
 }
 
 // ensureStorageDelta finds existing or allocate a new storageDelta for given {addr, aidx, global}
-func (cb *roundCowState) ensureStorageDelta(addr basics.Address, aidx basics.AppIndex, global bool, defaultAction storageAction) (*storageDelta, error) {
+func (cb *roundCowState) ensureStorageDelta(addr basics.Address, aidx basics.AppIndex, global bool, defaultAction storageAction, accountIdx uint64) (*storageDelta, error) {
 	// If we already have a storageDelta, return it
 	aapp := storagePtr{aidx, global}
 	lsd, ok := cb.sdeltas[addr][aapp]
@@ -119,6 +125,17 @@ func (cb *roundCowState) ensureStorageDelta(addr basics.Address, aidx basics.App
 		kvCow:     make(stateDelta),
 		counts:    &counts,
 		maxCounts: &maxCounts,
+	}
+
+	if cb.compatibilityMode && !global {
+		lsd.accountIdx = accountIdx
+
+		// if there was previous getKey call for this app and address, use that index instead
+		if s, ok := cb.compatibilityGetKeyCache[addr]; ok {
+			if idx, ok := s[aapp]; ok {
+				lsd.accountIdx = idx
+			}
+		}
 	}
 
 	_, ok = cb.sdeltas[addr]
@@ -216,7 +233,7 @@ func (cb *roundCowState) Allocate(addr basics.Address, aidx basics.AppIndex, glo
 		return err
 	}
 
-	lsd, err := cb.ensureStorageDelta(addr, aidx, global, allocAction)
+	lsd, err := cb.ensureStorageDelta(addr, aidx, global, allocAction, 0)
 	if err != nil {
 		return err
 	}
@@ -239,7 +256,7 @@ func (cb *roundCowState) Deallocate(addr basics.Address, aidx basics.AppIndex, g
 		return err
 	}
 
-	lsd, err := cb.ensureStorageDelta(addr, aidx, global, deallocAction)
+	lsd, err := cb.ensureStorageDelta(addr, aidx, global, deallocAction, 0)
 	if err != nil {
 		return err
 	}
@@ -252,13 +269,13 @@ func (cb *roundCowState) Deallocate(addr basics.Address, aidx basics.AppIndex, g
 }
 
 // GetKey looks for a key in {addr, aidx, global} storage
-func (cb *roundCowState) GetKey(addr basics.Address, aidx basics.AppIndex, global bool, key string) (basics.TealValue, bool, error) {
-	return cb.getKey(addr, aidx, global, key)
+func (cb *roundCowState) GetKey(addr basics.Address, aidx basics.AppIndex, global bool, key string, accountIdx uint64) (basics.TealValue, bool, error) {
+	return cb.getKey(addr, aidx, global, key, accountIdx)
 }
 
 // getKey looks for a key in {addr, aidx, global} storage
 // This is hierarchical lookup: if the key not in this cow cache, then request parent and all way down to ledger
-func (cb *roundCowState) getKey(addr basics.Address, aidx basics.AppIndex, global bool, key string) (basics.TealValue, bool, error) {
+func (cb *roundCowState) getKey(addr basics.Address, aidx basics.AppIndex, global bool, key string, accountIdx uint64) (basics.TealValue, bool, error) {
 	// Check that account has allocated storage
 	allocated, err := cb.allocated(addr, aidx, global)
 	if err != nil {
@@ -286,13 +303,28 @@ func (cb *roundCowState) getKey(addr basics.Address, aidx basics.AppIndex, globa
 		}
 	}
 
+	if cb.compatibilityMode && !global {
+		// if fetching a key first time for this app,
+		// cache account index, and use it later on lsd allocation
+		s, ok := cb.compatibilityGetKeyCache[addr]
+		if !ok {
+			s = map[storagePtr]uint64{{aidx, global}: accountIdx}
+			cb.compatibilityGetKeyCache[addr] = s
+		} else {
+			if _, ok := s[storagePtr{aidx, global}]; !ok {
+				s[storagePtr{aidx, global}] = accountIdx
+				cb.compatibilityGetKeyCache[addr] = s
+			}
+		}
+	}
+
 	// At this point, we know we're allocated, and we don't have a delta,
 	// so we should check our parent.
-	return cb.lookupParent.getKey(addr, aidx, global, key)
+	return cb.lookupParent.getKey(addr, aidx, global, key, accountIdx)
 }
 
 // SetKey creates a new key-value in {addr, aidx, global} storage
-func (cb *roundCowState) SetKey(addr basics.Address, aidx basics.AppIndex, global bool, key string, value basics.TealValue) error {
+func (cb *roundCowState) SetKey(addr basics.Address, aidx basics.AppIndex, global bool, key string, value basics.TealValue, accountIdx uint64) error {
 	// Enforce maximum key length
 	if len(key) > cb.proto.MaxAppKeyLen {
 		return fmt.Errorf("key too long: length was %d, maximum is %d", len(key), cb.proto.MaxAppKeyLen)
@@ -315,13 +347,13 @@ func (cb *roundCowState) SetKey(addr basics.Address, aidx basics.AppIndex, globa
 	}
 
 	// Fetch the old value + presence so we know how to update
-	oldValue, oldOk, err := cb.GetKey(addr, aidx, global, key)
+	oldValue, oldOk, err := cb.GetKey(addr, aidx, global, key, accountIdx)
 	if err != nil {
 		return err
 	}
 
 	// Write the value delta associated with this key/value
-	lsd, err := cb.ensureStorageDelta(addr, aidx, global, remainAllocAction)
+	lsd, err := cb.ensureStorageDelta(addr, aidx, global, remainAllocAction, accountIdx)
 	if err != nil {
 		return err
 	}
@@ -346,7 +378,7 @@ func (cb *roundCowState) SetKey(addr basics.Address, aidx basics.AppIndex, globa
 }
 
 // DelKey removes a key from {addr, aidx, global} storage
-func (cb *roundCowState) DelKey(addr basics.Address, aidx basics.AppIndex, global bool, key string) error {
+func (cb *roundCowState) DelKey(addr basics.Address, aidx basics.AppIndex, global bool, key string, accountIdx uint64) error {
 	// Check that account has allocated storage
 	allocated, err := cb.allocated(addr, aidx, global)
 	if err != nil {
@@ -358,13 +390,13 @@ func (cb *roundCowState) DelKey(addr basics.Address, aidx basics.AppIndex, globa
 	}
 
 	// Fetch the old value + presence so we know how to update counts
-	oldValue, oldOk, err := cb.GetKey(addr, aidx, global, key)
+	oldValue, oldOk, err := cb.GetKey(addr, aidx, global, key, accountIdx)
 	if err != nil {
 		return err
 	}
 
 	// Write the value delta associated with deleting this key
-	lsd, err := cb.ensureStorageDelta(addr, aidx, global, remainAllocAction)
+	lsd, err := cb.ensureStorageDelta(addr, aidx, global, remainAllocAction, accountIdx)
 	if err != nil {
 		return nil
 	}
@@ -410,7 +442,7 @@ func MakeDebugBalances(l ledgerForCowBase, round basics.Round, proto protocol.Co
 // Execution happens in a child cow and all modifications are merged into parent if the program passes
 func (cb *roundCowState) StatefulEval(params logic.EvalParams, aidx basics.AppIndex, program []byte) (pass bool, evalDelta basics.EvalDelta, err error) {
 	// Make a child cow to eval our program in
-	calf := cb.child()
+	calf := cb.child(1)
 	params.Ledger, err = newLogicLedger(calf, aidx)
 	if err != nil {
 		return false, basics.EvalDelta{}, err
@@ -419,7 +451,7 @@ func (cb *roundCowState) StatefulEval(params logic.EvalParams, aidx basics.AppIn
 	// Eval the program
 	pass, err = logic.EvalStateful(program, params)
 	if err != nil {
-		return false, basics.EvalDelta{}, err
+		return false, basics.EvalDelta{}, ledgercore.LogicEvalError{Err: err}
 	}
 
 	// If program passed, build our eval delta, and commit to state changes
@@ -456,17 +488,29 @@ func (cb *roundCowState) BuildEvalDelta(aidx basics.AppIndex, txn *transactions.
 				if evalDelta.LocalDeltas == nil {
 					evalDelta.LocalDeltas = make(map[uint64]basics.StateDelta)
 				}
+
 				// It is impossible for there to be more than one local delta for
 				// a particular (address, app ID) in sdeltas, because the appAddr
 				// type consists only of (address, appID, global=false). So if
 				// IndexByAddress is deterministic (and it is), there is no need
 				// to check for duplicates here.
 				var addrOffset uint64
-				addrOffset, err = txn.IndexByAddress(addr, txn.Sender)
-				if err != nil {
-					return basics.EvalDelta{}, err
+				if cb.compatibilityMode {
+					addrOffset = sdelta.accountIdx
+				} else {
+					addrOffset, err = txn.IndexByAddress(addr, txn.Sender)
+					if err != nil {
+						return basics.EvalDelta{}, err
+					}
 				}
-				evalDelta.LocalDeltas[addrOffset] = sdelta.kvCow.serialize()
+
+				d := sdelta.kvCow.serialize()
+				// noEmptyDeltas restricts prodicing empty local deltas in general
+				// but allows it for a period of time when a buggy version was live
+				noEmptyDeltas := cb.proto.NoEmptyLocalDeltas || (cb.mods.Hdr.CurrentProtocol == protocol.ConsensusV24) && (cb.mods.Hdr.NextProtocol != protocol.ConsensusV26)
+				if !noEmptyDeltas || len(d) != 0 {
+					evalDelta.LocalDeltas[addrOffset] = d
+				}
 			}
 		}
 	}
@@ -557,25 +601,30 @@ func applyStorageDelta(data basics.AccountData, aapp storagePtr, store *storageD
 	// duplicate code in branches is proven to be a bit faster than
 	// having basics.AppParams and basics.AppLocalState under a common interface with additional loops and type assertions
 	if aapp.global {
-		owned := make(map[basics.AppIndex]basics.AppParams, len(data.AppParams))
-		for k, v := range data.AppParams {
-			owned[k] = v
+		var owned map[basics.AppIndex]basics.AppParams
+		if len(data.AppParams) > 0 {
+			owned = make(map[basics.AppIndex]basics.AppParams, len(data.AppParams))
+			for k, v := range data.AppParams {
+				owned[k] = v
+			}
 		}
 
 		switch store.action {
 		case deallocAction:
 			delete(owned, aapp.aidx)
 		case allocAction, remainAllocAction:
-			// TODO verify this assertion
 			// note: these should always exist because they were
-			// at least preceded by a call to PutWithCreatable?
+			// at least preceded by a call to PutWithCreatable
 			params, ok := owned[aapp.aidx]
 			if !ok {
 				return basics.AccountData{}, fmt.Errorf("could not find existing params for %v", aapp.aidx)
 			}
 			params = params.Clone()
-			if store.action == allocAction {
-				// TODO does this ever accidentally clobber?
+			if (store.action == allocAction && len(store.kvCow) > 0) ||
+				(store.action == remainAllocAction && params.GlobalState == nil) {
+				// allocate KeyValue for
+				// 1) app creation and global write in the same app call
+				// 2) global state writing into empty global state
 				params.GlobalState = make(basics.TealKeyValue)
 			}
 			// note: if this is an allocAction, there will be no
@@ -593,25 +642,31 @@ func applyStorageDelta(data basics.AccountData, aapp storagePtr, store *storageD
 		data.AppParams = owned
 
 	} else {
-		owned := make(map[basics.AppIndex]basics.AppLocalState, len(data.AppLocalStates))
-		for k, v := range data.AppLocalStates {
-			owned[k] = v
+		var owned map[basics.AppIndex]basics.AppLocalState
+		if len(data.AppLocalStates) > 0 {
+			owned = make(map[basics.AppIndex]basics.AppLocalState, len(data.AppLocalStates))
+			for k, v := range data.AppLocalStates {
+				owned[k] = v
+			}
 		}
 
 		switch store.action {
 		case deallocAction:
 			delete(owned, aapp.aidx)
 		case allocAction, remainAllocAction:
-			// TODO verify this assertion
 			// note: these should always exist because they were
-			// at least preceded by a call to Put?
+			// at least preceded by a call to Put (opting in),
+			// or the account has opted in before and local states are pre-allocated
 			states, ok := owned[aapp.aidx]
 			if !ok {
 				return basics.AccountData{}, fmt.Errorf("could not find existing states for %v", aapp.aidx)
 			}
 			states = states.Clone()
-			if store.action == allocAction {
-				// TODO does this ever accidentally clobber?
+			if (store.action == allocAction && len(store.kvCow) > 0) ||
+				(store.action == remainAllocAction && states.KeyValue == nil) {
+				// allocate KeyValue for
+				// 1) opting in and local state write in the same app call
+				// 2) local state writing into empty local state (opted in)
 				states.KeyValue = make(basics.TealKeyValue)
 			}
 			// note: if this is an allocAction, there will be no
