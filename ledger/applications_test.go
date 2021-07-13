@@ -59,6 +59,7 @@ type mockCowForLogicLedger struct {
 	cr     map[creatableLocator]basics.Address
 	brs    map[basics.Address]basics.AccountData
 	stores map[storeLocator]basics.TealKeyValue
+	tcs    map[int]basics.CreatableIndex
 }
 
 func (c *mockCowForLogicLedger) Get(addr basics.Address, withPendingRewards bool) (basics.AccountData, error) {
@@ -67,6 +68,10 @@ func (c *mockCowForLogicLedger) Get(addr basics.Address, withPendingRewards bool
 		return basics.AccountData{}, fmt.Errorf("addr %s not in mock cow", addr.String())
 	}
 	return br, nil
+}
+
+func (c *mockCowForLogicLedger) GetCreatableID(groupIdx int) basics.CreatableIndex {
+	return c.tcs[groupIdx]
 }
 
 func (c *mockCowForLogicLedger) GetCreator(cidx basics.CreatableIndex, ctype basics.CreatableType) (basics.Address, bool, error) {
@@ -400,7 +405,7 @@ return`
 	program := ops.Program
 
 	proto := config.Consensus[protocol.ConsensusCurrentVersion]
-	genesisInitState, initKeys := testGenerateInitState(t, protocol.ConsensusCurrentVersion)
+	genesisInitState, initKeys := testGenerateInitState(t, protocol.ConsensusCurrentVersion, 100)
 
 	creator, err := basics.UnmarshalChecksumAddress("3LN5DBFC2UTPD265LQDP3LMTLGZCQ5M3JV7XTVTGRH5CKSVNQVDFPN6FG4")
 	a.NoError(err)
@@ -621,7 +626,7 @@ return`
 	program := ops.Program
 
 	proto := config.Consensus[protocol.ConsensusCurrentVersion]
-	genesisInitState, initKeys := testGenerateInitState(t, protocol.ConsensusCurrentVersion)
+	genesisInitState, initKeys := testGenerateInitState(t, protocol.ConsensusCurrentVersion, 100)
 
 	creator, err := basics.UnmarshalChecksumAddress("3LN5DBFC2UTPD265LQDP3LMTLGZCQ5M3JV7XTVTGRH5CKSVNQVDFPN6FG4")
 	a.NoError(err)
@@ -866,7 +871,7 @@ return`
 	program := ops.Program
 
 	proto := config.Consensus[protocol.ConsensusCurrentVersion]
-	genesisInitState, initKeys := testGenerateInitState(t, protocol.ConsensusCurrentVersion)
+	genesisInitState, initKeys := testGenerateInitState(t, protocol.ConsensusCurrentVersion, 100)
 
 	creator, err := basics.UnmarshalChecksumAddress("3LN5DBFC2UTPD265LQDP3LMTLGZCQ5M3JV7XTVTGRH5CKSVNQVDFPN6FG4")
 	a.NoError(err)
@@ -921,7 +926,7 @@ return`
 		Header:                   txHeader,
 		ApplicationCallTxnFields: appCallFields,
 	}
-	err = l.appendUnvalidatedTx(t, genesisInitState.Accounts, initKeys, appCall, transactions.ApplyData{
+	err = l.appendUnvalidatedTx(t, nil, initKeys, appCall, transactions.ApplyData{
 		EvalDelta: basics.EvalDelta{
 			LocalDeltas: map[uint64]basics.StateDelta{0: {"lk": basics.ValueDelta{
 				Action: basics.SetBytesAction,
@@ -970,6 +975,8 @@ return`
 	err = l.appendUnvalidated(blk)
 	a.NoError(err)
 
+	l.WaitForCommit(3)
+
 	// save data into DB and write into local state
 	l.accts.accountsWriting.Add(1)
 	l.accts.commitRound(3, 0, 0)
@@ -1013,7 +1020,7 @@ return`
 	program := ops.Program
 
 	proto := config.Consensus[protocol.ConsensusCurrentVersion]
-	genesisInitState, initKeys := testGenerateInitState(t, protocol.ConsensusCurrentVersion)
+	genesisInitState, initKeys := testGenerateInitState(t, protocol.ConsensusCurrentVersion, 100)
 
 	creator, err := basics.UnmarshalChecksumAddress("3LN5DBFC2UTPD265LQDP3LMTLGZCQ5M3JV7XTVTGRH5CKSVNQVDFPN6FG4")
 	a.NoError(err)
@@ -1200,7 +1207,7 @@ func testAppAccountDeltaIndicesCompatibility(t *testing.T, source string, accoun
 
 	// explicitly trigger compatibility mode
 	proto := config.Consensus[protocol.ConsensusV24]
-	genesisInitState, initKeys := testGenerateInitState(t, protocol.ConsensusV24)
+	genesisInitState, initKeys := testGenerateInitState(t, protocol.ConsensusV24, 100)
 
 	creator, err := basics.UnmarshalChecksumAddress("3LN5DBFC2UTPD265LQDP3LMTLGZCQ5M3JV7XTVTGRH5CKSVNQVDFPN6FG4")
 	a.NoError(err)

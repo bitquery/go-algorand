@@ -331,8 +331,13 @@ func (cb *roundCowState) SetKey(addr basics.Address, aidx basics.AppIndex, globa
 	}
 
 	// Enforce maximum value length
-	if value.Type == basics.TealBytesType && len(value.Bytes) > cb.proto.MaxAppBytesValueLen {
-		return fmt.Errorf("value too long for key 0x%x: length was %d, maximum is %d", key, len(value.Bytes), cb.proto.MaxAppBytesValueLen)
+	if value.Type == basics.TealBytesType {
+		if len(value.Bytes) > cb.proto.MaxAppBytesValueLen {
+			return fmt.Errorf("value too long for key 0x%x: length was %d", key, len(value.Bytes))
+		}
+		if sum := len(key) + len(value.Bytes); sum > cb.proto.MaxAppSumKeyValueLens {
+			return fmt.Errorf("key/value total too long for key 0x%x: sum was %d", key, sum)
+		}
 	}
 
 	// Check that account has allocated storage
@@ -505,7 +510,7 @@ func (cb *roundCowState) BuildEvalDelta(aidx basics.AppIndex, txn *transactions.
 				}
 
 				d := sdelta.kvCow.serialize()
-				// noEmptyDeltas restricts prodicing empty local deltas in general
+				// noEmptyDeltas restricts producing empty local deltas in general
 				// but allows it for a period of time when a buggy version was live
 				noEmptyDeltas := cb.proto.NoEmptyLocalDeltas || (cb.mods.Hdr.CurrentProtocol == protocol.ConsensusV24) && (cb.mods.Hdr.NextProtocol != protocol.ConsensusV26)
 				if !noEmptyDeltas || len(d) != 0 {

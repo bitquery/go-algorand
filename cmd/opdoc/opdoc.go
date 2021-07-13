@@ -28,13 +28,13 @@ import (
 	"github.com/algorand/go-algorand/protocol"
 )
 
-func opGroupMarkdownTable(og *logic.OpGroup, out io.Writer) {
+func opGroupMarkdownTable(names []string, out io.Writer) {
 	fmt.Fprint(out, `| Op | Description |
 | --- | --- |
 `)
 	opSpecs := logic.OpsByName[logic.LogicVersion]
 	// TODO: sort by logic.OpSpecs[].Opcode
-	for _, opname := range og.Ops {
+	for _, opname := range names {
 		spec := opSpecs[opname]
 		fmt.Fprintf(out, "| `%s%s` | %s |\n",
 			markdownTableEscape(spec.Name), immediateMarkdown(&spec),
@@ -50,7 +50,7 @@ func typeEnumTableMarkdown(out io.Writer) {
 	fmt.Fprintf(out, "| Index | \"Type\" string | Description |\n")
 	fmt.Fprintf(out, "| --- | --- | --- |\n")
 	for i, name := range logic.TxnTypeNames {
-		fmt.Fprintf(out, "| %d | %s | %s |\n", i, markdownTableEscape(name), logic.TypeNameDescription(name))
+		fmt.Fprintf(out, "| %d | %s | %s |\n", i, markdownTableEscape(name), logic.TypeNameDescriptions[name])
 	}
 	out.Write([]byte("\n"))
 }
@@ -69,7 +69,7 @@ func integerConstantsTableMarkdown(out io.Writer) {
 	fmt.Fprintf(out, "| Value | Constant name | Description |\n")
 	fmt.Fprintf(out, "| --- | --- | --- |\n")
 	for i, name := range logic.TxnTypeNames {
-		fmt.Fprintf(out, "| %d | %s | %s |\n", i, markdownTableEscape(name), logic.TypeNameDescription(name))
+		fmt.Fprintf(out, "| %d | %s | %s |\n", i, markdownTableEscape(name), logic.TypeNameDescriptions[name])
 	}
 	out.Write([]byte("\n"))
 }
@@ -119,7 +119,6 @@ func opToMarkdown(out io.Writer, op *logic.OpSpec) (err error) {
 	if opextra != "" {
 		ws = " "
 	}
-	costs := logic.OpAllCosts(op.Name)
 	fmt.Fprintf(out, "\n## %s%s\n\n- Opcode: 0x%02x%s%s\n", op.Name, immediateMarkdown(op), op.Opcode, ws, opextra)
 	if op.Args == nil {
 		fmt.Fprintf(out, "- Pops: _None_\n")
@@ -148,13 +147,18 @@ func opToMarkdown(out io.Writer, op *logic.OpSpec) (err error) {
 	}
 	fmt.Fprintf(out, "- %s\n", logic.OpDoc(op.Name))
 	// if cost changed with versions print all of them
+	costs := logic.OpAllCosts(op.Name)
 	if len(costs) > 1 {
 		fmt.Fprintf(out, "- **Cost**:\n")
-		for v := 1; v < len(costs); v++ {
-			fmt.Fprintf(out, "   - %d (LogicSigVersion = %d)\n", costs[v], v)
+		for _, cost := range costs {
+			if cost.From == cost.To {
+				fmt.Fprintf(out, "   - %d (LogicSigVersion = %d)\n", cost.Cost, cost.To)
+			} else {
+				fmt.Fprintf(out, "   - %d (%d <= LogicSigVersion <= %d)\n", cost.Cost, cost.From, cost.To)
+			}
 		}
 	} else {
-		cost := costs[0]
+		cost := costs[0].Cost
 		if cost != 1 {
 			fmt.Fprintf(out, "- **Cost**: %d\n", cost)
 		}
@@ -221,13 +225,13 @@ type LanguageSpec struct {
 }
 
 func argEnum(name string) []string {
-	if name == "txn" || name == "gtxn" {
+	if name == "txn" || name == "gtxn" || name == "gtxns" {
 		return logic.TxnFieldNames
 	}
 	if name == "global" {
 		return logic.GlobalFieldNames
 	}
-	if name == "txna" || name == "gtxna" {
+	if name == "txna" || name == "gtxna" || name == "gtxnsa" {
 		return logic.TxnaFieldNames
 	}
 	if name == "asset_holding_get" {
@@ -262,13 +266,13 @@ func typeString(types []logic.StackType) string {
 }
 
 func argEnumTypes(name string) string {
-	if name == "txn" || name == "gtxn" {
+	if name == "txn" || name == "gtxn" || name == "gtxns" {
 		return typeString(logic.TxnFieldTypes)
 	}
 	if name == "global" {
 		return typeString(logic.GlobalFieldTypes)
 	}
-	if name == "txna" || name == "gtxna" {
+	if name == "txna" || name == "gtxna" || name == "gtxnsa" {
 		return typeString(logic.TxnaFieldTypes)
 	}
 	if name == "asset_holding_get" {
@@ -310,14 +314,14 @@ func main() {
 	opsToMarkdown(opcodesMd)
 	opcodesMd.Close()
 	opGroups := make(map[string][]string, len(logic.OpSpecs))
-	for _, og := range logic.OpGroupList {
-		fname := fmt.Sprintf("%s.md", og.GroupName)
+	for grp, names := range logic.OpGroups {
+		fname := fmt.Sprintf("%s.md", grp)
 		fname = strings.ReplaceAll(fname, " ", "_")
 		fout, _ := os.Create(fname)
-		opGroupMarkdownTable(&og, fout)
+		opGroupMarkdownTable(names, fout)
 		fout.Close()
-		for _, opname := range og.Ops {
-			opGroups[opname] = append(opGroups[opname], og.GroupName)
+		for _, opname := range names {
+			opGroups[opname] = append(opGroups[opname], grp)
 		}
 	}
 	constants, _ := os.Create("named_integer_constants.md")

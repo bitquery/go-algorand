@@ -60,15 +60,15 @@ func txnGroupFromParams(dp *DebugParams) (txnGroup []transactions.SignedTxn, err
 
 	// 1. Attempt json - a single transaction
 	var txn transactions.SignedTxn
-	err = protocol.DecodeJSON(data, &txn)
-	if err == nil {
+	err1 := protocol.DecodeJSON(data, &txn)
+	if err1 == nil {
 		txnGroup = append(txnGroup, txn)
 		return
 	}
 
 	// 2. Attempt json - array of transactions
-	err = protocol.DecodeJSON(data, &txnGroup)
-	if err == nil {
+	err2 := protocol.DecodeJSON(data, &txnGroup)
+	if err2 == nil {
 		return
 	}
 
@@ -87,6 +87,16 @@ func txnGroupFromParams(dp *DebugParams) (txnGroup []transactions.SignedTxn, err
 		txnGroup = append(txnGroup, txn)
 	}
 
+	// if conversion failed report all intermediate decoding errors
+	if err != nil {
+		if err1 != nil {
+			log.Printf("Decoding as JSON txn failed: %s", err1.Error())
+		}
+		if err2 != nil {
+			log.Printf("Decoding as JSON txn group failed: %s", err2.Error())
+		}
+	}
+
 	return
 }
 
@@ -101,19 +111,19 @@ func balanceRecordsFromParams(dp *DebugParams) (records []basics.BalanceRecord, 
 
 	// 1. Attempt json - a single record
 	var record basics.BalanceRecord
-	err = protocol.DecodeJSON(data, &record)
-	if err == nil {
+	err1 := protocol.DecodeJSON(data, &record)
+	if err1 == nil {
 		records = append(records, record)
 		return
 	}
 
 	// 2. Attempt json - a array of records
-	err = protocol.DecodeJSON(data, &records)
-	if err == nil {
+	err2 := protocol.DecodeJSON(data, &records)
+	if err2 == nil {
 		return
 	}
 
-	// 2. Attempt msgp - a array of records
+	// 3. Attempt msgp - a array of records
 	dec := protocol.NewDecoderBytes(data)
 	for {
 		var record basics.BalanceRecord
@@ -126,6 +136,16 @@ func balanceRecordsFromParams(dp *DebugParams) (records []basics.BalanceRecord, 
 			break
 		}
 		records = append(records, record)
+	}
+
+	// if conversion failed report all intermediate decoding errors
+	if err != nil {
+		if err1 != nil {
+			log.Printf("Decoding as JSON record failed: %s", err1.Error())
+		}
+		if err2 != nil {
+			log.Printf("Decoding as JSON array of records failed: %s", err2.Error())
+		}
 	}
 
 	return
@@ -185,16 +205,17 @@ const (
 
 // evaluation is a description of a single debugger run
 type evaluation struct {
-	program      []byte
-	source       string
-	offsetToLine map[int]int
-	name         string
-	groupIndex   int
-	mode         modeType
-	aidx         basics.AppIndex
-	ba           apply.Balances
-	result       evalResult
-	states       AppState
+	program         []byte
+	source          string
+	offsetToLine    map[int]int
+	name            string
+	groupIndex      int
+	pastSideEffects []logic.EvalSideEffects
+	mode            modeType
+	aidx            basics.AppIndex
+	ba              apply.Balances
+	result          evalResult
+	states          AppState
 }
 
 func (e *evaluation) eval(ep logic.EvalParams) (pass bool, err error) {
@@ -319,6 +340,17 @@ func (r *LocalRunner) Setup(dp *DebugParams) (err error) {
 		dp.LatestTimestamp = int64(ddr.LatestTimestamp)
 	}
 
+	if dp.PastSideEffects == nil {
+		dp.PastSideEffects = logic.MakePastSideEffects(len(r.txnGroup))
+	} else if len(dp.PastSideEffects) != len(r.txnGroup) {
+		err = fmt.Errorf(
+			"invalid past side effects slice with length %d should match group length of %d txns",
+			len(dp.PastSideEffects),
+			len(r.txnGroup),
+		)
+		return
+	}
+
 	// if program(s) specified then run from it
 	if len(dp.ProgramBlobs) > 0 {
 		if len(r.txnGroup) == 1 && dp.GroupIndex != 0 {
@@ -335,7 +367,10 @@ func (r *LocalRunner) Setup(dp *DebugParams) (err error) {
 			r.runs[i].program = data
 			if IsTextFile(data) {
 				source := string(data)
-				ops, err := logic.AssembleStringWithVersion(source, r.proto.LogicSigVersion)
+				ops, err := logic.AssembleString(source)
+				if ops.Version > r.proto.LogicSigVersion {
+					return fmt.Errorf("Program version (%d) is beyond the maximum supported protocol version (%d)", ops.Version, r.proto.LogicSigVersion)
+				}
 				if err != nil {
 					errorLines := ""
 					for _, lineError := range ops.Errors {
@@ -353,6 +388,7 @@ func (r *LocalRunner) Setup(dp *DebugParams) (err error) {
 				}
 			}
 			r.runs[i].groupIndex = dp.GroupIndex
+			r.runs[i].pastSideEffects = dp.PastSideEffects
 			r.runs[i].name = dp.ProgramNames[i]
 
 			var mode modeType
@@ -415,12 +451,13 @@ func (r *LocalRunner) Setup(dp *DebugParams) (err error) {
 						return
 					}
 					run := evaluation{
-						program:    stxn.Txn.ApprovalProgram,
-						groupIndex: gi,
-						mode:       modeStateful,
-						aidx:       appIdx,
-						ba:         b,
-						states:     states,
+						program:         stxn.Txn.ApprovalProgram,
+						groupIndex:      gi,
+						pastSideEffects: dp.PastSideEffects,
+						mode:            modeStateful,
+						aidx:            appIdx,
+						ba:              b,
+						states:          states,
 					}
 					r.runs = append(r.runs, run)
 				}
@@ -450,12 +487,13 @@ func (r *LocalRunner) Setup(dp *DebugParams) (err error) {
 								return
 							}
 							run := evaluation{
-								program:    program,
-								groupIndex: gi,
-								mode:       modeStateful,
-								aidx:       appIdx,
-								ba:         b,
-								states:     states,
+								program:         program,
+								groupIndex:      gi,
+								pastSideEffects: dp.PastSideEffects,
+								mode:            modeStateful,
+								aidx:            appIdx,
+								ba:              b,
+								states:          states,
 							}
 							r.runs = append(r.runs, run)
 							found = true
@@ -490,11 +528,12 @@ func (r *LocalRunner) RunAll() error {
 		r.debugger.SaveProgram(run.name, run.program, run.source, run.offsetToLine, run.states)
 
 		ep := logic.EvalParams{
-			Proto:      &r.proto,
-			Debugger:   r.debugger,
-			Txn:        &r.txnGroup[groupIndex],
-			TxnGroup:   r.txnGroup,
-			GroupIndex: run.groupIndex,
+			Proto:           &r.proto,
+			Debugger:        r.debugger,
+			Txn:             &r.txnGroup[groupIndex],
+			TxnGroup:        r.txnGroup,
+			GroupIndex:      run.groupIndex,
+			PastSideEffects: run.pastSideEffects,
 		}
 
 		run.result.pass, run.result.err = run.eval(ep)
@@ -518,10 +557,11 @@ func (r *LocalRunner) Run() (bool, error) {
 	run := r.runs[0]
 
 	ep := logic.EvalParams{
-		Proto:      &r.proto,
-		Txn:        &r.txnGroup[groupIndex],
-		TxnGroup:   r.txnGroup,
-		GroupIndex: run.groupIndex,
+		Proto:           &r.proto,
+		Txn:             &r.txnGroup[groupIndex],
+		TxnGroup:        r.txnGroup,
+		GroupIndex:      run.groupIndex,
+		PastSideEffects: run.pastSideEffects,
 	}
 
 	// Workaround for Go's nil/empty interfaces nil check after nil assignment, i.e.

@@ -582,7 +582,7 @@ var appExecuteCmd = &cobra.Command{
 			localSchema = header.Query.Local.ToStateSchema()
 			globalSchema = header.Query.Global.ToStateSchema()
 		}
-		tx, err := client.MakeUnsignedApplicationCallTx(appIdx, appArgs, appAccounts, foreignApps, foreignAssets, onCompletion, approvalProg, clearProg, globalSchema, localSchema)
+		tx, err := client.MakeUnsignedApplicationCallTx(appIdx, appArgs, appAccounts, foreignApps, foreignAssets, onCompletion, approvalProg, clearProg, globalSchema, localSchema, 0)
 		if err != nil {
 			reportErrorf("Cannot create application txn: %v", err)
 		}
@@ -600,6 +600,10 @@ var appExecuteCmd = &cobra.Command{
 		tx, err = client.FillUnsignedTxTemplate(account, fv, lv, fee, tx)
 		if err != nil {
 			reportErrorf("Cannot construct transaction: %s", err)
+		}
+		explicitFee := cmd.Flags().Changed("fee")
+		if explicitFee {
+			tx.Fee = basics.MicroAlgos{Raw: fee}
 		}
 
 		if outFilename == "" {
@@ -622,14 +626,9 @@ var appExecuteCmd = &cobra.Command{
 			reportInfof("Issued transaction from account %s, txid %s (fee %d)", tx.Sender, txid, tx.Fee.Raw)
 
 			if !noWaitAfterSend {
-				err = waitForCommit(client, txid)
+				txn, err := waitForCommit(client, txid, lv)
 				if err != nil {
 					reportErrorf(err.Error())
-				}
-				// Check if we know about the transaction yet
-				txn, err := client.PendingTransactionInformation(txid)
-				if err != nil {
-					reportErrorf("%v", err)
 				}
 				if txn.TransactionResults != nil && txn.TransactionResults.CreatedAppIndex != 0 {
 					reportInfof("Created app with app index %d", txn.TransactionResults.CreatedAppIndex)

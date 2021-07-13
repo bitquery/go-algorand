@@ -101,7 +101,6 @@ func OpenLedger(
 	log logging.Logger, dbPathPrefix string, dbMem bool, genesisInitState InitState, cfg config.Local,
 ) (*Ledger, error) {
 	var err error
-
 	verifiedCacheSize := cfg.VerifiedTranscationsCacheSize
 	if verifiedCacheSize < cfg.TxPoolSize {
 		verifiedCacheSize = cfg.TxPoolSize
@@ -259,15 +258,24 @@ func openLedgerDB(dbPathPrefix string, dbMem bool) (trackerDBs db.Pair, blockDBs
 	trackerDBFilename = dbPathPrefix + ".tracker.sqlite"
 	blockDBFilename = dbPathPrefix + ".block.sqlite"
 
-	trackerDBs, err = db.OpenPair(trackerDBFilename, dbMem)
-	if err != nil {
-		return
-	}
+	outErr := make(chan error, 2)
+	go func() {
+		var lerr error
+		trackerDBs, lerr = db.OpenPair(trackerDBFilename, dbMem)
+		outErr <- lerr
+	}()
 
-	blockDBs, err = db.OpenPair(blockDBFilename, dbMem)
+	go func() {
+		var lerr error
+		blockDBs, lerr = db.OpenPair(blockDBFilename, dbMem)
+		outErr <- lerr
+	}()
+
+	err = <-outErr
 	if err != nil {
 		return
 	}
+	err = <-outErr
 	return
 }
 
@@ -322,26 +330,6 @@ func initBlocksDB(tx *sql.Tx, l *Ledger, initBlocks []bookkeeping.Block, isArchi
 			if err != nil {
 				err = fmt.Errorf("initBlocksDB.blockInit 2 %v", err)
 				return err
-			}
-		}
-
-		// Manually replace block 0, even if we already had it
-		// (necessary to normalize the payset commitment because of a
-		// bug that caused its value to change)
-		//
-		// Don't bother for non-archival nodes since they will toss
-		// block 0 almost immediately
-		//
-		// TODO remove this once a version containing this code has
-		// been deployed to archival nodes
-		if len(initBlocks) > 0 && initBlocks[0].Round() == basics.Round(0) {
-			updated, err := blockReplaceIfExists(tx, l.log, initBlocks[0], agreement.Certificate{})
-			if err != nil {
-				err = fmt.Errorf("initBlocksDB.blockReplaceIfExists %v", err)
-				return err
-			}
-			if updated {
-				l.log.Infof("initBlocksDB replaced block 0")
 			}
 		}
 	}
@@ -504,8 +492,10 @@ func (l *Ledger) Latest() basics.Round {
 
 // LatestCommitted returns the last block round number written to
 // persistent storage.  This block, and all previous blocks, are
-// guaranteed to be available after a crash.
-func (l *Ledger) LatestCommitted() basics.Round {
+// guaranteed to be available after a crash. In addition, it returns
+// the latest block round number added to the ledger ( which will be
+// flushed to persistent storage later on )
+func (l *Ledger) LatestCommitted() (basics.Round, basics.Round) {
 	return l.blockQ.latestCommitted()
 }
 
@@ -545,7 +535,7 @@ func (l *Ledger) BlockCert(rnd basics.Round) (blk bookkeeping.Block, cert agreem
 func (l *Ledger) AddBlock(blk bookkeeping.Block, cert agreement.Certificate) error {
 	// passing nil as the executionPool is ok since we've asking the evaluator to skip verification.
 
-	updates, err := eval(context.Background(), l, blk, false, l.verifiedTxnCache, nil, true)
+	updates, err := eval(context.Background(), l, blk, false, l.verifiedTxnCache, nil)
 	if err != nil {
 		return err
 	}
@@ -574,6 +564,7 @@ func (l *Ledger) AddValidatedBlock(vb ValidatedBlock, cert agreement.Certificate
 	}
 	l.headerCache.Put(vb.blk.Round(), vb.blk.BlockHeader)
 	l.trackers.newBlock(vb.blk, vb.delta)
+	l.log.Debugf("added blk %d", vb.blk.Round())
 	return nil
 }
 
@@ -647,7 +638,7 @@ func (l *Ledger) trackerLog() logging.Logger {
 // evaluator to shortcut the "main" ledger ( i.e. this struct ) and avoid taking the trackers lock a second time.
 func (l *Ledger) trackerEvalVerified(blk bookkeeping.Block, accUpdatesLedger ledgerForEvaluator) (ledgercore.StateDelta, error) {
 	// passing nil as the executionPool is ok since we've asking the evaluator to skip verification.
-	return eval(context.Background(), accUpdatesLedger, blk, false, l.verifiedTxnCache, nil, false)
+	return eval(context.Background(), accUpdatesLedger, blk, false, l.verifiedTxnCache, nil)
 }
 
 // IsWritingCatchpointFile returns true when a catchpoint file is being generated. The function is used by the catchup service

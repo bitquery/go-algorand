@@ -42,14 +42,15 @@ func getFirstAccountFromNamedNode(fixture *fixtures.RestClientFixture, r *requir
 
 func waitUntilRewards(t *testing.T, fixture *fixtures.RestClientFixture, round uint64) (uint64, error) {
 	block, err := fixture.AlgodClient.Block(round)
-	require.NoError(t, err)
+	a := require.New(fixtures.SynchronizedTest(t))
+	a.NoError(err)
 
 	for {
 		round++
 		err := fixture.WaitForRoundWithTimeout(round + 1)
-		require.NoError(t, err)
+		a.NoError(err)
 		nextBlock, err := fixture.AlgodClient.Block(round)
-		require.NoError(t, err)
+		a.NoError(err)
 
 		if nextBlock.RewardsLevel > block.RewardsLevel {
 			// reward level increased, rewards were granted
@@ -64,18 +65,19 @@ func waitUntilRewards(t *testing.T, fixture *fixtures.RestClientFixture, round u
 }
 
 func spendToNonParticipating(t *testing.T, fixture *fixtures.RestClientFixture, lastRound uint64, account string, balance uint64, minFee uint64) uint64 {
+	a := require.New(fixtures.SynchronizedTest(t))
 	// move a lot of Algos to a non participating account -- the incentive pool
 	poolAddr := basics.Address{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff} // hardcoded; change if the pool address changes
 	pd := poolAddr
 	drainTx, err := fixture.LibGoalClient.SendPaymentFromUnencryptedWallet(account, pd.String(), minFee, balance-balance/100-minFee, nil)
-	require.NoError(t, err)
+	a.NoError(err)
 	fixture.WaitForAllTxnsToConfirm(lastRound+uint64(10), map[string]string{drainTx.ID().String(): account})
 	return balance / 100
 }
 
 func TestOnlineOfflineRewards(t *testing.T) {
 	t.Parallel()
-	r := require.New(t)
+	r := require.New(fixtures.SynchronizedTest(t))
 
 	var fixture fixtures.RestClientFixture
 	fixture.Setup(t, filepath.Join("nettemplates", "FourNodes.json"))
@@ -137,7 +139,7 @@ func TestPartkeyOnlyRewards(t *testing.T) {
 		t.Skip()
 	}
 	t.Parallel()
-	r := require.New(t)
+	r := require.New(fixtures.SynchronizedTest(t))
 
 	var fixture fixtures.RestClientFixture
 	fixture.Setup(t, filepath.Join("nettemplates", "FourNodes.json"))
@@ -180,7 +182,7 @@ func TestPartkeyOnlyRewards(t *testing.T) {
 
 func TestRewardUnitThreshold(t *testing.T) {
 	t.Parallel()
-	r := require.New(t)
+	r := require.New(fixtures.SynchronizedTest(t))
 
 	var fixture fixtures.RestClientFixture
 	fixture.Setup(t, filepath.Join("nettemplates", "FourNodes.json"))
@@ -290,8 +292,8 @@ func TestRewardUnitThreshold(t *testing.T) {
 	r.Truef(latestBalancePoorAccount.AmountWithoutPendingRewards >= updatedBalancePoorAccount.Amount+amountRichAccountPokesWith, "rewards should have been applied")
 
 	// Test e2e REST API convenience computations
-	r.Truef(latestBalanceNewAccount.PendingRewards >= (initialBalanceNewAccount+amountRichAccountPokesWith)/rewardUnit, "new account should have pending rewards (e2e)")
-	r.Truef(latestBalancePoorAccount.Rewards-latestBalancePoorAccount.PendingRewards >= updatedBalancePoorAccount.Rewards, "poor account rewards should have been applied")
+	r.GreaterOrEqualf(latestBalanceNewAccount.PendingRewards, (initialBalanceNewAccount+amountRichAccountPokesWith)/rewardUnit, "new account should have pending rewards (e2e)")
+	r.GreaterOrEqualf(latestBalancePoorAccount.Rewards-latestBalancePoorAccount.PendingRewards, updatedBalancePoorAccount.Rewards, "poor account rewards should have been applied")
 
 }
 
@@ -299,7 +301,7 @@ var defaultPoolAddr = basics.Address{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0
 
 func TestRewardRateRecalculation(t *testing.T) {
 	t.Parallel()
-	r := require.New(t)
+	r := require.New(fixtures.SynchronizedTest(t))
 
 	// consensusTestRapidRewardRecalculation is a version of ConsensusCurrentVersion
 	// that decreases the RewardsRateRefreshInterval greatly.

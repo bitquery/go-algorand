@@ -17,7 +17,6 @@
 package nodecontrol
 
 import (
-	"os"
 	"path/filepath"
 	"syscall"
 	"time"
@@ -102,36 +101,36 @@ func (nc NodeController) FullStop() error {
 
 // stopProcesses attempts to read PID files for algod and kmd and kill the
 // corresponding processes. If it can't read a PID file, it doesn't return an
-// error, but if it reads a PID file and the process doesn't die, it does
+// error, but if it reads a PID file and the process doesn't die, it does.
 func (nc NodeController) stopProcesses() (kmdAlreadyStopped bool, err error) {
-	err = nc.StopAlgod()
-	if err != nil {
-		return
-	}
+	errAlgod := nc.StopAlgod()
 	kmdAlreadyStopped, err = nc.StopKMD()
+	if errAlgod != nil {
+		err = errAlgod
+	}
 	return
 }
 
-func killPID(pid int) error {
-	process, err := os.FindProcess(pid)
+func killPID(pid int) (killed bool, err error) {
+	process, err := util.FindProcess(pid)
 	if process == nil || err != nil {
-		return err
+		return false, err
 	}
 
 	err = util.KillProcess(pid, syscall.SIGTERM)
 	if err != nil {
-		return err
+		return false, err
 	}
 	waitLong := time.After(time.Second * 30)
 	for {
 		// Send null signal - if process still exists, it'll return nil
 		// So when we get an error, assume it's gone.
 		if err = process.Signal(syscall.Signal(0)); err != nil {
-			return nil
+			return false, nil
 		}
 		select {
 		case <-waitLong:
-			return util.KillProcess(pid, syscall.SIGKILL)
+			return true, util.KillProcess(pid, syscall.SIGKILL)
 		case <-time.After(time.Millisecond * 100):
 		}
 	}

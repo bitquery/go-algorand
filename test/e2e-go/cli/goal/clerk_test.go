@@ -22,11 +22,13 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/algorand/go-algorand/test/framework/fixtures"
 )
 
 func TestClerkSendNoteEncoding(t *testing.T) {
 	defer fixture.SetTestContext(t)()
-	a := require.New(t)
+	a := require.New(fixtures.SynchronizedTest(t))
 
 	// wait for consensus on first round prior to sending transactions, time out after 2 minutes
 	err := fixture.WaitForRound(2, time.Duration(2*time.Minute))
@@ -42,14 +44,14 @@ func TestClerkSendNoteEncoding(t *testing.T) {
 	account := accounts[0].Address
 
 	const noteText = "Sample Text-based Note"
-	txID, err := fixture.ClerkSend(account, account, 100, 1, noteText)
+	txID, err := fixture.ClerkSend(account, account, 100, 1000, noteText)
 	a.NoError(err)
 	a.NotEmpty(txID)
 
 	// Send 2nd txn using the note encoded as base-64 (using --noteb64)
 	originalNoteb64Text := "Noteb64-encoded text With Binary \u0001x1x0x3"
 	noteb64 := base64.StdEncoding.EncodeToString([]byte(originalNoteb64Text))
-	txID2, err := fixture.ClerkSendNoteb64(account, account, 100, 1, noteb64)
+	txID2, err := fixture.ClerkSendNoteb64(account, account, 100, 1000, noteb64)
 	a.NoError(err)
 	a.NotEmpty(txID2)
 

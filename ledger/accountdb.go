@@ -521,27 +521,27 @@ func getCatchpoint(tx *sql.Tx, round basics.Round) (fileName string, catchpoint 
 //
 // accountsInit returns nil if either it has initialized the database
 // correctly, or if the database has already been initialized.
-func accountsInit(tx *sql.Tx, initAccounts map[basics.Address]basics.AccountData, proto config.ConsensusParams) error {
+func accountsInit(tx *sql.Tx, initAccounts map[basics.Address]basics.AccountData, proto config.ConsensusParams) (newDatabase bool, err error) {
 	for _, tableCreate := range accountsSchema {
-		_, err := tx.Exec(tableCreate)
+		_, err = tx.Exec(tableCreate)
 		if err != nil {
-			return err
+			return
 		}
 	}
 
 	// Run creatables migration if it hasn't run yet
 	var creatableMigrated bool
-	err := tx.QueryRow("SELECT 1 FROM pragma_table_info('assetcreators') WHERE name='ctype'").Scan(&creatableMigrated)
+	err = tx.QueryRow("SELECT 1 FROM pragma_table_info('assetcreators') WHERE name='ctype'").Scan(&creatableMigrated)
 	if err == sql.ErrNoRows {
 		// Run migration
 		for _, migrateCmd := range creatablesMigration {
 			_, err = tx.Exec(migrateCmd)
 			if err != nil {
-				return err
+				return
 			}
 		}
 	} else if err != nil {
-		return err
+		return
 	}
 
 	_, err = tx.Exec("INSERT INTO acctrounds (id, rnd) VALUES ('acctbase', 0)")
@@ -553,30 +553,32 @@ func accountsInit(tx *sql.Tx, initAccounts map[basics.Address]basics.AccountData
 			_, err = tx.Exec("INSERT INTO accountbase (address, data) VALUES (?, ?)",
 				addr[:], protocol.Encode(&data))
 			if err != nil {
-				return err
+				return true, err
 			}
 
 			totals.AddAccount(proto, data, &ot)
 		}
 
 		if ot.Overflowed {
-			return fmt.Errorf("overflow computing totals")
+			return true, fmt.Errorf("overflow computing totals")
 		}
 
 		err = accountsPutTotals(tx, totals, false)
 		if err != nil {
-			return err
+			return true, err
 		}
+		newDatabase = true
 	} else {
 		serr, ok := err.(sqlite3.Error)
 		// serr.Code is sqlite.ErrConstraint if the database has already been initialized;
 		// in that case, ignore the error and return nil.
 		if !ok || serr.Code != sqlite3.ErrConstraint {
-			return err
+			return
 		}
+
 	}
 
-	return nil
+	return newDatabase, nil
 }
 
 // accountsAddNormalizedBalance adds the normalizedonlinebalance column
@@ -1180,7 +1182,7 @@ func accountsNewRound(tx *sql.Tx, updates compactAccountDeltas, creatables map[b
 }
 
 // totalsNewRounds updates the accountsTotals by applying series of round changes
-func totalsNewRounds(tx *sql.Tx, updates []ledgercore.AccountDeltas, compactUpdates compactAccountDeltas, accountTotals []ledgercore.AccountTotals, protos []config.ConsensusParams) (err error) {
+func totalsNewRounds(tx *sql.Tx, updates []ledgercore.AccountDeltas, compactUpdates compactAccountDeltas, accountTotals []ledgercore.AccountTotals, proto config.ConsensusParams) (err error) {
 	var ot basics.OverflowTracker
 	totals, err := accountsTotals(tx, false)
 	if err != nil {
@@ -1201,13 +1203,13 @@ func totalsNewRounds(tx *sql.Tx, updates []ledgercore.AccountDeltas, compactUpda
 			addr, data := updates[i].GetByIdx(j)
 
 			if oldAccountData, has := accounts[addr]; has {
-				totals.DelAccount(protos[i], oldAccountData, &ot)
+				totals.DelAccount(proto, oldAccountData, &ot)
 			} else {
 				err = fmt.Errorf("missing old account data")
 				return
 			}
 
-			totals.AddAccount(protos[i], data, &ot)
+			totals.AddAccount(proto, data, &ot)
 			accounts[addr] = data
 		}
 	}
@@ -1357,15 +1359,19 @@ func reencodeAccounts(ctx context.Context, tx *sql.Tx) (modifiedAccounts uint, e
 	return
 }
 
-type merkleCommitter struct {
+// MerkleCommitter todo
+//msgp:ignore MerkleCommitter
+type MerkleCommitter struct {
 	tx         *sql.Tx
 	deleteStmt *sql.Stmt
 	insertStmt *sql.Stmt
 	selectStmt *sql.Stmt
 }
 
-func makeMerkleCommitter(tx *sql.Tx, staging bool) (mc *merkleCommitter, err error) {
-	mc = &merkleCommitter{tx: tx}
+// MakeMerkleCommitter creates a MerkleCommitter object that implements the merkletrie.Committer interface allowing storing and loading
+// merkletrie pages from a sqlite database.
+func MakeMerkleCommitter(tx *sql.Tx, staging bool) (mc *MerkleCommitter, err error) {
+	mc = &MerkleCommitter{tx: tx}
 	accountHashesTable := "accounthashes"
 	if staging {
 		accountHashesTable = "catchpointaccounthashes"
@@ -1385,8 +1391,8 @@ func makeMerkleCommitter(tx *sql.Tx, staging bool) (mc *merkleCommitter, err err
 	return mc, nil
 }
 
-// StorePage is the merkletrie.Committer interface implementation, stores a single page in a sqllite database table.
-func (mc *merkleCommitter) StorePage(page uint64, content []byte) error {
+// StorePage is the merkletrie.Committer interface implementation, stores a single page in a sqlite database table.
+func (mc *MerkleCommitter) StorePage(page uint64, content []byte) error {
 	if len(content) == 0 {
 		_, err := mc.deleteStmt.Exec(page)
 		return err
@@ -1395,8 +1401,8 @@ func (mc *merkleCommitter) StorePage(page uint64, content []byte) error {
 	return err
 }
 
-// LoadPage is the merkletrie.Committer interface implementation, load a single page from a sqllite database table.
-func (mc *merkleCommitter) LoadPage(page uint64) (content []byte, err error) {
+// LoadPage is the merkletrie.Committer interface implementation, load a single page from a sqlite database table.
+func (mc *MerkleCommitter) LoadPage(page uint64) (content []byte, err error) {
 	err = mc.selectStmt.QueryRow(page).Scan(&content)
 	if err == sql.ErrNoRows {
 		content = nil

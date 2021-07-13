@@ -41,7 +41,7 @@ type nodeExitErrorCollector struct {
 	errors   []error
 	messages []string
 	mu       deadlock.Mutex
-	t        *testing.T
+	t        fixtures.TestingTB
 }
 
 func (ec *nodeExitErrorCollector) nodeExitWithError(nc *nodecontrol.NodeController, err error) {
@@ -79,10 +79,11 @@ func (ec *nodeExitErrorCollector) Print() {
 }
 
 func TestBasicCatchpointCatchup(t *testing.T) {
+	t.Skip("Temporarily disabling since they need work and shouldn't block releases")
 	if testing.Short() {
 		t.Skip()
 	}
-	a := require.New(t)
+	a := require.New(fixtures.SynchronizedTest(t))
 	log := logging.TestingLog(t)
 
 	// Overview of this test:
@@ -115,7 +116,7 @@ func TestBasicCatchpointCatchup(t *testing.T) {
 	var fixture fixtures.RestClientFixture
 	fixture.SetConsensus(consensus)
 
-	errorsCollector := nodeExitErrorCollector{t: t}
+	errorsCollector := nodeExitErrorCollector{t: fixtures.SynchronizedTest(t)}
 	defer errorsCollector.Print()
 
 	// Give the second node (which starts up last) all the stake so that its proposal always has better credentials,
@@ -200,7 +201,7 @@ func TestBasicCatchpointCatchup(t *testing.T) {
 	targetRound = uint64(1)
 	log.Infof("Second node catching up to round 1")
 	for {
-		err = fixture.ClientWaitForRound(secondNodeRestClient, currentRound, 10000*time.Millisecond)
+		err = fixture.ClientWaitForRound(secondNodeRestClient, currentRound, 10*time.Second)
 		a.NoError(err)
 		if targetRound <= currentRound {
 			break
@@ -220,7 +221,7 @@ func TestBasicCatchpointCatchup(t *testing.T) {
 	targetRound = uint64(37)
 	log.Infof("Second node catching up to round 36")
 	for {
-		err = fixture.ClientWaitForRound(secondNodeRestClient, currentRound, 10000*time.Millisecond)
+		err = fixture.ClientWaitForRound(secondNodeRestClient, currentRound, 10*time.Second)
 		a.NoError(err)
 		if targetRound <= currentRound {
 			break
